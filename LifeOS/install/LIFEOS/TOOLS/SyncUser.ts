@@ -111,6 +111,17 @@ function cmdSync(): void {
   const msgFlag = process.argv.indexOf("-m");
   const msg = msgFlag >= 0 ? process.argv[msgFlag + 1] : `sync from ${hostname()}`;
 
+  // Git does not track empty directories, so an empty LEARNING/ never reaches the
+  // second node and its symlink dangles there. Keepfiles make the layout survive a
+  // clone. (Found by `doctor` on the first real two-node round trip.)
+  for (const d of LINKED) {
+    const dir = join(CONFIG_DIR, "MEMORY", d);
+    const keep = join(dir, ".gitkeep");
+    if (existsSync(dir) && !existsSync(keep)) {
+      Bun.write(keep, "# keeps this dir in git; empty dirs are not tracked\n");
+    }
+  }
+
   // Commit local work FIRST so the rebase has something coherent to replay.
   if (git(["status", "--porcelain"]).out) {
     git(["add", "-A"]);
