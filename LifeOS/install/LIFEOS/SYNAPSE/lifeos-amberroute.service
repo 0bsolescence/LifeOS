@@ -1,0 +1,6 @@
+[Unit]
+Description=LifeOS Synapse — amber ledger routing pass
+
+[Service]
+Type=oneshot
+ExecStart=__HOME__/.local/bin/amber route --apply
