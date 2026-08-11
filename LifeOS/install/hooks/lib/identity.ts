@@ -48,6 +48,7 @@ const DEFAULT_IDENTITY = {
   displayName: 'LifeOS',
   mainDAVoiceID: '',
   color: '#3B82F6',
+  icon: '\u{1F5E3}\uFE0F',
 };
 
 const DEFAULT_PRINCIPAL = {
@@ -83,6 +84,8 @@ export interface VoicePersonality {
 
 export interface Identity {
   name: string;
+  /** Glyph for the closer line. Configurable so an assistant can look like itself. */
+  icon: string;
   fullName: string;
   displayName: string;
   mainDAVoiceID: string;
@@ -245,6 +248,7 @@ function legacyIdentity(): Identity {
       displayName: daidentity.displayName || daidentity.name || envDA || DEFAULT_IDENTITY.displayName,
       mainDAVoiceID: mainVoiceId || DEFAULT_IDENTITY.mainDAVoiceID,
       color: daidentity.color || DEFAULT_IDENTITY.color,
+      icon: daidentity.icon || DEFAULT_IDENTITY.icon,
       voice: voiceConfig as VoiceProsody | undefined,
       personality: daidentity.personality as VoicePersonality | undefined,
     };
@@ -261,6 +265,7 @@ function legacyIdentity(): Identity {
     displayName: core.display_name || core.name || DEFAULT_IDENTITY.displayName,
     mainDAVoiceID: mainVoice.voice_id || DEFAULT_IDENTITY.mainDAVoiceID,
     color: core.color || DEFAULT_IDENTITY.color,
+    icon: core.icon || DEFAULT_IDENTITY.icon,
     voice: mapFrontmatterVoice(mainVoice),
     personality: mapFrontmatterPersonality(fm.personality?.traits, voice.base_voice),
   };

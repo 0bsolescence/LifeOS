@@ -28,12 +28,25 @@ const DA_IDENTITY = getIdentity();
 // generic pattern (any ≤32-char name, colon REQUIRED) is a fallback for the
 // misconfigured-name case only, and never fires when the anchored form matched.
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Fork patch (a1a3bec, replayed onto 7.40.4): the closer glyph is CONFIGURABLE
+// via DA_IDENTITY.icon so an assistant can look like itself (this install uses
+// the raven). Both the configured glyph and the shipped default are accepted —
+// a half-applied icon change must never blind the voice-line parser. Upstream's
+// pattern structure (name-anchored first, generic fallback) is kept as-is; only
+// the glyph literal is parameterised.
+const DEFAULT_CLOSER_GLYPH = '\u{1F5E3}\uFE0F';
+const CLOSER_GLYPH = (() => {
+  const configured = DA_IDENTITY.icon || DEFAULT_CLOSER_GLYPH;
+  const alts = Array.from(new Set([configured, DEFAULT_CLOSER_GLYPH])).map(escapeRe);
+  return `(?:${alts.join('|')})`;
+})();
 function voiceLinePatterns(): RegExp[] {
   const pats: RegExp[] = [];
   if (DA_IDENTITY.name) {
-    pats.push(new RegExp(`🗣️\\s*\\*{0,2}${escapeRe(DA_IDENTITY.name)}:\\*{0,2}\\s*(.+?)(?:\\n|$)`, 'gi'));
+    pats.push(new RegExp(`${CLOSER_GLYPH}\\s*\\*{0,2}${escapeRe(DA_IDENTITY.name)}:\\*{0,2}\\s*(.+?)(?:\\n|$)`, 'gi'));
   }
-  pats.push(new RegExp(`🗣️\\s*\\*{0,2}[^:\\n]{1,32}:\\*{0,2}\\s*(.+?)(?:\\n|$)`, 'gi'));
+  pats.push(new RegExp(`${CLOSER_GLYPH}\\s*\\*{0,2}[^:\\n]{1,32}:\\*{0,2}\\s*(.+?)(?:\\n|$)`, 'gi'));
   return pats;
 }
 
@@ -291,7 +304,7 @@ export function extractStructuredSections(text: string): StructuredResponse {
     results: /✅\s*RESULTS:\s*(.+?)(?:\n|$)/i,
     status: /📊\s*STATUS:\s*(.+?)(?:\n|$)/i,
     next: /➡️\s*NEXT:\s*(.+?)(?:\n|$)/i,
-    completed: new RegExp(`(?:🗣️\\s*[^:\\n]{1,32}:|🎯\\s*COMPLETED:)\\s*(.+?)(?:\\n|$)`, 'i'),
+    completed: new RegExp(`(?:${CLOSER_GLYPH}\\s*[^:\\n]{1,32}:|🎯\\s*COMPLETED:)\\s*(.+?)(?:\\n|$)`, 'i'),
   };
 
   for (const [key, pattern] of Object.entries(patterns)) {

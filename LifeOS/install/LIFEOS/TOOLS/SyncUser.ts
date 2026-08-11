@@ -106,6 +106,21 @@ function cmdStatus(): void {
   }
 }
 
+
+function cmdPull(): void {
+  requireRepo();
+  const dirty = git(["status", "--porcelain"]).out;
+  if (dirty) {
+    // Refuse rather than stash: unattended code must never touch uncommitted user work.
+    console.error(`local changes present on ${hostname()} — not pulling. Run 'sync' deliberately.`);
+    console.error(dirty.split("\n").map(l => "  " + l).join("\n"));
+    process.exit(1);
+  }
+  const r = git(["pull", "--rebase"]);
+  if (r.code !== 0) { console.error(`pull failed:\n${r.err || r.out}`); process.exit(1); }
+  console.log(`${hostname()}: ${r.out.split("\n").slice(-1)[0] || "up to date"}`);
+}
+
 function cmdSync(): void {
   requireRepo();
   const msgFlag = process.argv.indexOf("-m");
@@ -152,12 +167,14 @@ function cmdSync(): void {
 switch (process.argv[2]) {
   case "doctor": cmdDoctor(); break;
   case "status": cmdStatus(); break;
+  case "pull": cmdPull(); break;
   case "sync": cmdSync(); break;
   default:
     console.log(`SyncUser — multi-machine sync for the LifeOS USER zone
 
   SyncUser.ts status   what would sync; how far ahead/behind the remote is
   SyncUser.ts doctor   verify symlinks and that no machine-local tree got captured
+  SyncUser.ts pull     pull only, never commits. Refuses if the tree is dirty.
   SyncUser.ts sync     commit, pull --rebase, push. Halts loudly on conflict.
 
 shared:        USER/, MEMORY/KNOWLEDGE, MEMORY/LEARNING, SYNAPSE config

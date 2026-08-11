@@ -79,6 +79,29 @@ if (existsSync(gen)) {
     "re-apply from the patches/v7.28.3 branch in your fork");
 }
 
+// ── 7. DA icon survived the last upgrade ──
+// LIFEOS_SYSTEM_PROMPT.md is a system file that Update step 3 deliberately overwrites,
+// so a configured closer glyph silently reverts to the shipped default on upgrade.
+// The gate accepts both, so nothing breaks loudly; it just quietly stops being yours.
+{
+  const cfgPath = join(HOME, ".config/LIFEOS/USER/CONFIG/LIFEOS_CONFIG.toml");
+  const promptPath = join(HOME, ".claude/LIFEOS/LIFEOS_SYSTEM_PROMPT.md");
+  if (existsSync(cfgPath) && existsSync(promptPath)) {
+    const m = readFileSync(cfgPath, "utf-8").match(/^icon\s*=\s*"([^"]+)"/m);
+    const configured = m?.[1];
+    if (!configured) {
+      add("DA icon configured", true, "no custom icon set, default in use");
+    } else {
+      const prompt = readFileSync(promptPath, "utf-8");
+      add("DA icon in system prompt", prompt.includes(configured),
+        prompt.includes(configured)
+          ? `system prompt uses ${configured}`
+          : `configured ${configured} but system prompt reverted to the default`,
+        "re-apply the glyph to LIFEOS_SYSTEM_PROMPT.md; it is overwritten by Update step 3");
+    }
+  }
+}
+
 // ── 7. USER tree still symlinked and resolving ──
 const userLink = join(HOME, ".claude/LIFEOS/USER");
 const resolved = sh(`readlink -f ${userLink}`);
