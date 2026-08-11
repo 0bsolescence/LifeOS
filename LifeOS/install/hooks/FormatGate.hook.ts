@@ -36,6 +36,7 @@
  */
 
 import { readHookInput, parseTranscriptFromInput } from "./lib/hook-io";
+import { getIdentity } from "./lib/identity";
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 
@@ -72,7 +73,14 @@ function visibleLines(text: string): string[] {
 }
 
 const BANNER = /════\s*LifeOS/;
-const CLOSER = /🗣️/;
+const CLOSER = (() => {
+  const DEFAULT_GLYPH = "\u{1F5E3}\uFE0F";
+  let configured = DEFAULT_GLYPH;
+  try { configured = getIdentity().icon || DEFAULT_GLYPH; } catch { /* config unreadable: fall back */ }
+  const esc = (g: string) => g.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Both are accepted: a half-applied icon change must not fail every turn.
+  return new RegExp(`${esc(configured)}|${esc(DEFAULT_GLYPH)}`);
+})();
 const MEMORY_LINE = /🧠\s*MEMORY\s*:/;
 const SYSTEM_LINE = /⚙️?\s*SYSTEM\s*:/;
 
