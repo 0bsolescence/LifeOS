@@ -957,8 +957,11 @@ function retrievalCounts(): Map<string, number> {
       continue; // A torn line in an append-only log is not a reason to abandon the rest.
     }
 
+    // A row must prove it is inside the window. An absent or malformed ts is not
+    // evidence of recency — counting it would reinforce a note forever and quietly
+    // defeat the 90-day bound (codex review, 2026-08-20).
     const ts = typeof row.ts === "string" ? Date.parse(row.ts) : NaN;
-    if (Number.isFinite(ts) && ts < cutoff) continue;
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
 
     // The documented summary row carries no note identity; a writer that wants to
     // feed reinforcement emits one of these arrays alongside it.

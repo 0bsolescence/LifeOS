@@ -163,6 +163,23 @@ describe("reinforcement degrades safely", () => {
     expect(isStale(r.out, "survives-a-torn-log")).toBe(false);
   });
 
+  test("rows with a missing or malformed timestamp cannot reinforce (codex P2)", () => {
+    // An unbounded row would otherwise spare the note forever, defeating the window.
+    seedling("no-timestamp");
+    const rows = [
+      JSON.stringify({ slugs: ["no-timestamp"] }),
+      JSON.stringify({ ts: "not a date", slugs: ["no-timestamp"] }),
+      JSON.stringify({ ts: 1755600000000, slugs: ["no-timestamp"] }),
+      JSON.stringify({ ts: null, slugs: ["no-timestamp"] }),
+    ];
+    writeFileSync(join(obs, "memory-retrievals.jsonl"), rows.join("\n") + "\n");
+
+    const r = status();
+
+    expect(r.code).toBe(0);
+    expect(isStale(r.out, "no-timestamp")).toBe(true);
+  });
+
   test("summary rows with no note identity are ignored rather than crashing", () => {
     seedling("summary-only");
     const rows = Array.from({ length: 10 }, () =>
