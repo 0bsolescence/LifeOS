@@ -242,6 +242,41 @@ function isClaimed(h: Handoff): boolean {
 }
 
 /**
+ * The open manifests that may still be accepted.
+ *
+ * A per-manifest claim alone is not enough: with two open handoffs from one node, a
+ * second run could see the newest one claimed, skip it, and accept its predecessor
+ * before the first run expired it — two ACCEPTEDs, one of them a stale handoff, which
+ * is the exact shadowing this lifecycle exists to prevent (codex review, 2026-08-20).
+ *
+ * A claim therefore consumes the whole node, not one file: once any manifest from node
+ * N is claimed, every earlier manifest from N is ineligible, because the accept in
+ * flight will expire them. If that accept crashed before writing, the predecessors stay
+ * ineligible — the same outcome as the completed accept, which is the consistent one.
+ *
+ * A manifest whose node cannot be determined is blocked by any claim at all, matching
+ * the expiry rule: an un-attributable handoff is the dangerous case, not the safe one.
+ */
+function eligibleOpen(all: Handoff[]): Handoff[] {
+  const claimedAt = new Map<string, number>();
+  let unattributedClaim = -Infinity;
+  for (const h of all) {
+    if (!isClaimed(h)) continue;
+    const n = nodeOf(h);
+    if (n === null) unattributedClaim = Math.max(unattributedClaim, h.mtimeMs);
+    else claimedAt.set(n, Math.max(claimedAt.get(n) ?? -Infinity, h.mtimeMs));
+  }
+  const anyClaim = Math.max(unattributedClaim, ...claimedAt.values());
+
+  return all.filter((h) => {
+    if (stateOf(h) !== "open" || isClaimed(h)) return false;
+    const n = nodeOf(h);
+    const barrier = n === null ? anyClaim : Math.max(claimedAt.get(n) ?? -Infinity, unattributedClaim);
+    return h.mtimeMs > barrier;
+  });
+}
+
+/**
  * Atomically claim the right to accept `h`. Exactly one caller can win, because
  * link() either creates the marker or fails with EEXIST — there is no window in
  * which two processes both believe they hold it.
@@ -320,7 +355,7 @@ function latest(): void {
   if (process.argv.includes("--peek")) {
     const all = listHandoffs();
     if (all.length === 0) { console.error("no handoff files"); process.exit(1); }
-    const open = all.filter((h) => stateOf(h) === "open" && !isClaimed(h));
+    const open = eligibleOpen(all);
     const target = open[0] ?? all[0];
     console.error(
       open.length > 0
@@ -349,8 +384,7 @@ function accept(): AcceptResult {
   const all = listHandoffs();
   if (all.length === 0) return { path: "", notes: [], error: "no handoff files" };
 
-  // A claimed manifest has been consumed even if a crash left its frontmatter open.
-  const open = all.filter((h) => stateOf(h) === "open" && !isClaimed(h));
+  const open = eligibleOpen(all);
 
   if (open.length === 0) {
     // Every handoff has already been consumed. Still hand back the newest so a summons

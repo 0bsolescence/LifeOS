@@ -388,7 +388,9 @@ describe("concurrent accepts", () => {
       .toEqual([".accepted-session-handoff-20260820.md"]);
   });
 
-  test("a claimed manifest is passed over even if a crash left it open", () => {
+  test("a claim on the newest blocks its predecessors from the same node (codex P1)", () => {
+    // The race: a second run must not slip in and accept the OLDER handoff while the
+    // first run holds the newest and has not yet expired it.
     seed("session-handoff-20260819.md", { ageMinutes: 200 });
     seed("session-handoff-20260820.md", { ageMinutes: 10 });
     writeFileSync(join(work, ".accepted-session-handoff-20260820.md"), "node-x 2026-08-20T00:00:00Z");
@@ -396,8 +398,36 @@ describe("concurrent accepts", () => {
     const r = run(["--latest"]);
 
     expect(r.code).toBe(0);
+    expect(r.stderr).toContain("no open handoff");
+    expect(r.stderr).not.toContain("ACCEPTED");
+    expect(stateOf("session-handoff-20260819.md")).toBe("open");
+  });
+
+  test("a claim does not block a different node's handoff", () => {
+    seed("session-handoff-20260819.md", { node: "l3420", ageMinutes: 200 });
+    seed("session-handoff-20260820.md", { node: "l7440", ageMinutes: 10 });
+    writeFileSync(join(work, ".accepted-session-handoff-20260820.md"), "l7440 2026-08-20T00:00:00Z");
+
+    const r = run(["--latest"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("ACCEPTED");
     expect(r.stdout.trim()).toBe(join(work, "session-handoff-20260819.md"));
-    expect(stateOf("session-handoff-20260820.md")).toBe("open");
+  });
+
+  test("concurrent runs over several open handoffs from one node yield one acceptor", async () => {
+    seed("session-handoff-20260818.md", { ageMinutes: 400 });
+    seed("session-handoff-20260819.md", { ageMinutes: 200 });
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    const results = await Promise.all(Array.from({ length: 6 }, () => runAsync(["--latest"])));
+
+    const accepted = results.filter((r) => r.stderr.includes("ACCEPTED"));
+    expect(accepted.length).toBe(1);
+    // And the one accepted is the newest — never a stale predecessor.
+    expect(accepted[0].stdout.trim()).toBe(join(work, "session-handoff-20260820.md"));
+    expect(stateOf("session-handoff-20260819.md")).toBe("expired");
+    expect(stateOf("session-handoff-20260818.md")).toBe("expired");
   });
 
   test("no lock file is created — there is no staleness rule to get wrong", () => {
