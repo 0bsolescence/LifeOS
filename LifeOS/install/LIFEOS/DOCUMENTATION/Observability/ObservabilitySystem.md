@@ -52,7 +52,7 @@ JSONL Sources (local disk)
 | Pending proposals (Tier C queue) | `MEMORY/OBSERVABILITY/pending-proposals.jsonl` | — | `MemorySystem.add()` for `type:proposal`. Status lifecycle: pending → sent → accepted/rejected/edited. Surfaced by `LIFEOS/PULSE/lib/memory-proposals.ts` on the Pulse dashboard and the inline 🧠 MEMORY line for accept/reject/edit. |
 | Identity proposals (archive) | `MEMORY/OBSERVABILITY/identity-proposals.jsonl` | — | `LIFEOS/PULSE/lib/memory-proposals.ts` surfacer. Archive of sent/accepted/rejected/edited proposals. |
 | Proposal replies | `MEMORY/OBSERVABILITY/proposal-replies.jsonl` | — | Pulse dashboard reply handler. Records accept/reject/edit interactions. |
-| Memory retrievals | `MEMORY/OBSERVABILITY/memory-retrievals.jsonl` | — | `MemoryRetriever.getRelevantContext()` (ISC-107..112; not yet populated as of 2026-05-23; infrastructure ready). Per-turn BM25 audit. |
+| Memory retrievals | `MEMORY/OBSERVABILITY/memory-retrievals.jsonl` | — | `MemoryRetriever.getRelevantContext()` (ISC-107..112; not yet populated as of 2026-05-23; infrastructure ready). Per-turn BM25 audit. **Consumed by** `KnowledgeHarvester` access reinforcement (A4, 2026-08-20): a seedling retrieved ≥3 times in the trailing 90 days is spared the age-based archive sweep. That reader needs per-note identity, which the summary row shape above does not carry — a writer must emit a `slugs` (or `returned` / `items`) array alongside it. Until one exists, reinforcement is dormant and expiry runs on age alone. |
 
 Per-source counts are configured inline in `Pulse/Observability/observability.ts`.
 

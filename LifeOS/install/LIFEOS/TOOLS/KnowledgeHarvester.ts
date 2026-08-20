@@ -148,6 +148,36 @@ const MAX_NOTES_PER_HARVEST_DEFAULT = 5;
 const MAX_NOTES_BACKFILL = 50;
 const SEEDLING_EXPIRY_DAYS = 90;
 
+// ============================================================================
+// Access reinforcement (A4, 2026-08-20) — adopted from ai-memory's decay model,
+// where retrieval reinforces a memory instead of age alone deciding its fate.
+//
+// A seedling that keeps getting pulled into context is being used, whatever its
+// quality score says. Archiving it on age alone throws away the note the corpus
+// has already proven it needs, so a note retrieved often enough inside the same
+// window the expiry judges is spared.
+//
+// THRESHOLD: 3 retrievals inside the trailing 90 days. The window matches
+// SEEDLING_EXPIRY_DAYS so both rules speak about the same period. Three is the
+// smallest count that is not explicable as noise: one retrieval is a stray hit,
+// two is a coincidence, three inside the very window in which the note would
+// otherwise be judged dead is a use pattern. Reinforcement only ever SPARES a
+// note — it never archives one, so an over-generous threshold costs disk, and a
+// stingy one costs knowledge.
+//
+// STATUS: DORMANT. memory-retrievals.jsonl has no writer — ObservabilitySystem.md
+// records it as "not yet populated as of 2026-05-23; infrastructure ready" — and
+// the row shape MemoryStatus.ts documents (ts/query_hash/top_score/returned_count)
+// carries no per-note identity. This reader therefore also accepts an identity
+// array (slugs / returned / items) that a future writer must emit. Until one
+// exists the file is absent, counts are empty, and expiry behaves exactly as it
+// does today.
+// ============================================================================
+
+const RETRIEVALS_FILE = path.join(MEMORY_DIR, "OBSERVABILITY", "memory-retrievals.jsonl");
+const RETRIEVAL_WINDOW_DAYS = SEEDLING_EXPIRY_DAYS;
+const RETRIEVAL_REINFORCEMENT_MIN = 3;
+
 const DOMAINS = ["People", "Companies", "Ideas", "Research"];
 
 // Object type classification keywords
@@ -830,6 +860,7 @@ function getArchiveStats(): ArchiveStats {
 
   const allSlugs = new Set<string>();
   const allLinks = new Set<string>();
+  const retrievals = retrievalCounts();
 
   for (const domain of DOMAINS) {
     const domainDir = path.join(KNOWLEDGE_DIR, domain);
@@ -861,11 +892,13 @@ function getArchiveStats(): ArchiveStats {
         allLinks.add(match[1]);
       }
 
-      // Check stale low-quality notes
+      // Check stale low-quality notes. A reinforced note is not reported stale,
+      // so the report says the same thing the expiry sweep will do.
       if (quality <= 2 && fm.created) {
         const created = new Date(fm.created);
         const daysSince = (Date.now() - created.getTime()) / (1000 * 60 * 60 * 24);
-        if (daysSince > SEEDLING_EXPIRY_DAYS) {
+        const reinforced = (retrievals.get(slug.toLowerCase()) ?? 0) >= RETRIEVAL_REINFORCEMENT_MIN;
+        if (daysSince > SEEDLING_EXPIRY_DAYS && !reinforced) {
           stats.staleSeedlings.push(`${domain}/${slug}`);
         }
       }
@@ -883,7 +916,68 @@ function getArchiveStats(): ArchiveStats {
   return stats;
 }
 
-function expireStaleSeedlings(backlinks: Map<string, number>): string[] {
+/** Normalize any note reference — slug, filename, or path — to a bare lowercase slug. */
+function retrievalSlug(raw: unknown): string | null {
+  let s: string | null = null;
+  if (typeof raw === "string") s = raw;
+  else if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    for (const k of ["slug", "id", "path", "file", "title"]) {
+      if (typeof o[k] === "string") { s = o[k] as string; break; }
+    }
+  }
+  if (!s) return null;
+  const base = s.split("/").pop()!.replace(/\.md$/i, "").trim().toLowerCase();
+  return base === "" ? null : base;
+}
+
+/**
+ * Per-note retrieval counts inside the trailing window, from memory-retrievals.jsonl.
+ * A missing, empty, or malformed log yields an empty map — reinforcement degrades to
+ * today's age-only behaviour rather than failing the sweep.
+ */
+function retrievalCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  if (!fs.existsSync(RETRIEVALS_FILE)) return counts;
+
+  const cutoff = Date.now() - RETRIEVAL_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(RETRIEVALS_FILE, "utf-8");
+  } catch {
+    return counts;
+  }
+
+  for (const line of raw.split("\n")) {
+    if (line.trim() === "") continue;
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue; // A torn line in an append-only log is not a reason to abandon the rest.
+    }
+
+    const ts = typeof row.ts === "string" ? Date.parse(row.ts) : NaN;
+    if (Number.isFinite(ts) && ts < cutoff) continue;
+
+    // The documented summary row carries no note identity; a writer that wants to
+    // feed reinforcement emits one of these arrays alongside it.
+    const items = [row.slugs, row.returned, row.items].find(Array.isArray) as unknown[] | undefined;
+    if (!items) continue;
+
+    // One retrieval counts once per note, however many times the row repeats it.
+    const seen = new Set<string>();
+    for (const item of items) {
+      const slug = retrievalSlug(item);
+      if (slug) seen.add(slug);
+    }
+    for (const slug of seen) counts.set(slug, (counts.get(slug) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+function expireStaleSeedlings(backlinks: Map<string, number>, retrievals: Map<string, number>): string[] {
   const expired: string[] = [];
   for (const domain of DOMAINS) {
     const domainDir = path.join(KNOWLEDGE_DIR, domain);
@@ -905,6 +999,10 @@ function expireStaleSeedlings(backlinks: Map<string, number>): string[] {
       // #1574, @asdf8675309)
       const slug = file.replace(/\.md$/, "").toLowerCase();
       if ((backlinks.get(slug) ?? 0) > 0) continue; // Has references, don't expire
+
+      // Access reinforcement: a note the corpus keeps reaching for is in use,
+      // whatever its quality score says.
+      if ((retrievals.get(slug) ?? 0) >= RETRIEVAL_REINFORCEMENT_MIN) continue;
 
       // Move to archive
       const archivePath = path.join(ARCHIVE_DIR, file);
@@ -992,7 +1090,7 @@ function cmdHarvest(sourceFilter: string | null, dryRun: boolean, maxNotes: numb
 
   if (!dryRun) {
     // Expire stale seedlings in the committed archive
-    const expired = expireStaleSeedlings(computeBacklinks());
+    const expired = expireStaleSeedlings(computeBacklinks(), retrievalCounts());
     if (expired.length > 0) {
       console.log(`\n  📦 Archived ${expired.length} stale low-quality note(s):`);
       for (const e of expired) console.log(`     ${e}`);
