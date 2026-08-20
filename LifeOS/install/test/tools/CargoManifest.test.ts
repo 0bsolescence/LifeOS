@@ -386,6 +386,20 @@ describe("concurrent accepts", () => {
     expect(readdirSync(work)).not.toContain(".cargo-accept.lock");
   });
 
+  test("several runs meeting the same abandoned lock still produce one acceptor (codex P2)", async () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+    const lock = join(work, ".cargo-accept.lock");
+    writeFileSync(lock, "99999 stale");
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+
+    const results = await Promise.all(Array.from({ length: 6 }, () => runAsync(["--latest"])));
+
+    expect(results.filter((r) => r.stderr.includes("ACCEPTED")).length).toBe(1);
+    for (const r of results) expect(r.code).toBe(0);
+    expect(readdirSync(work).filter((f) => f.startsWith(".cargo-accept.lock"))).toEqual([]);
+  });
+
   test("an abandoned lock is broken rather than blocking forever", () => {
     seed("session-handoff-20260820.md", { ageMinutes: 10 });
     const lock = join(work, ".cargo-accept.lock");

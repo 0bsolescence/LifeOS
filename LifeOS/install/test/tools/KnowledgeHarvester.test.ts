@@ -180,6 +180,31 @@ describe("reinforcement degrades safely", () => {
     expect(isStale(r.out, "no-timestamp")).toBe(true);
   });
 
+  test("rows timestamped in the future cannot reinforce (codex P2)", () => {
+    // A skewed writer clock would otherwise pin a note above the cutoff forever.
+    seedling("from-the-future");
+    const rows = Array.from({ length: 5 }, (_, i) =>
+      JSON.stringify({ ts: daysAgo(-30 - i), slugs: ["from-the-future"] }),
+    );
+    writeFileSync(join(obs, "memory-retrievals.jsonl"), rows.join("\n") + "\n");
+
+    const r = status();
+
+    expect(r.code).toBe(0);
+    expect(isStale(r.out, "from-the-future")).toBe(true);
+  });
+
+  test("a small clock skew is tolerated rather than discarded", () => {
+    seedling("slightly-ahead");
+    const soon = new Date(Date.now() + 60_000).toISOString();
+    const rows = Array.from({ length: THRESHOLD }, () => JSON.stringify({ ts: soon, slugs: ["slightly-ahead"] }));
+    writeFileSync(join(obs, "memory-retrievals.jsonl"), rows.join("\n") + "\n");
+
+    const r = status();
+
+    expect(isStale(r.out, "slightly-ahead")).toBe(false);
+  });
+
   test("summary rows with no note identity are ignored rather than crashing", () => {
     seedling("summary-only");
     const rows = Array.from({ length: 10 }, () =>

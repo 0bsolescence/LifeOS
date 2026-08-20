@@ -177,6 +177,8 @@ const SEEDLING_EXPIRY_DAYS = 90;
 const RETRIEVALS_FILE = path.join(MEMORY_DIR, "OBSERVABILITY", "memory-retrievals.jsonl");
 const RETRIEVAL_WINDOW_DAYS = SEEDLING_EXPIRY_DAYS;
 const RETRIEVAL_REINFORCEMENT_MIN = 3;
+/** Tolerance for an honestly-skewed writer clock; beyond it a future ts is a bad row. */
+const RETRIEVAL_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const DOMAINS = ["People", "Companies", "Ideas", "Research"];
 
@@ -941,6 +943,7 @@ function retrievalCounts(): Map<string, number> {
   if (!fs.existsSync(RETRIEVALS_FILE)) return counts;
 
   const cutoff = Date.now() - RETRIEVAL_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const ceiling = Date.now() + RETRIEVAL_CLOCK_SKEW_MS;
   let raw: string;
   try {
     raw = fs.readFileSync(RETRIEVALS_FILE, "utf-8");
@@ -957,11 +960,12 @@ function retrievalCounts(): Map<string, number> {
       continue; // A torn line in an append-only log is not a reason to abandon the rest.
     }
 
-    // A row must prove it is inside the window. An absent or malformed ts is not
-    // evidence of recency — counting it would reinforce a note forever and quietly
-    // defeat the 90-day bound (codex review, 2026-08-20).
+    // A row must prove it is inside the window at BOTH ends. An absent or malformed ts
+    // is not evidence of recency, and a timestamp from the future — a skewed clock, a
+    // bad writer — would reinforce its notes forever. Either way the 90-day bound is
+    // quietly defeated, so both are skipped (codex review, 2026-08-20).
     const ts = typeof row.ts === "string" ? Date.parse(row.ts) : NaN;
-    if (!Number.isFinite(ts) || ts < cutoff) continue;
+    if (!Number.isFinite(ts) || ts < cutoff || ts > ceiling) continue;
 
     // The documented summary row carries no note identity; a writer that wants to
     // feed reinforcement emits one of these arrays alongside it.

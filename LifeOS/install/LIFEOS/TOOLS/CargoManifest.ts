@@ -225,6 +225,35 @@ function isEexist(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "EEXIST";
 }
 
+/**
+ * Remove an abandoned lock, but only the exact one observed to be stale.
+ *
+ * A plain unlink here is wrong when several processes see the same stale lock: one
+ * removes it and acquires a fresh lock, and the others then unlink the NEW owner's
+ * lock on the strength of their old observation, so two of them enter accept() at
+ * once (codex review, 2026-08-20). rename() is atomic, so exactly one process moves
+ * the file that is currently at the lock path; the inode check then tells us whether
+ * we moved the stale lock we meant to or a live one that replaced it. A live one is
+ * put back with link(), which declines to overwrite whatever owns the path by then.
+ */
+function breakStaleLock(staleIno: number): void {
+  const stolen = `${LOCK_PATH}.stale-${process.pid}-${Date.now()}`;
+  try {
+    renameSync(LOCK_PATH, stolen);
+  } catch {
+    return; // someone else moved it first; go back to competing for the lock
+  }
+  try {
+    if (statSync(stolen).ino !== staleIno) {
+      // We took a live lock. Restore it if the path is still free; if a third process
+      // has since claimed it, dropping ours is correct — that process is the owner.
+      try { linkSync(stolen, LOCK_PATH); } catch { /* claimed in the meantime */ }
+    }
+  } finally {
+    try { unlinkSync(stolen); } catch { /* nothing to clean up */ }
+  }
+}
+
 /** Run fn holding the exclusive accept lock. A lock older than 30s is presumed abandoned. */
 function withAcceptLock<T>(fn: () => T): T {
   const deadline = Date.now() + LOCK_WAIT_MS;
@@ -239,8 +268,9 @@ function withAcceptLock<T>(fn: () => T): T {
     } catch (e) {
       if (!isEexist(e)) throw e;
       try {
-        if (Date.now() - statSync(LOCK_PATH).mtimeMs > LOCK_STALE_MS) {
-          unlinkSync(LOCK_PATH);
+        const held = statSync(LOCK_PATH);
+        if (Date.now() - held.mtimeMs > LOCK_STALE_MS) {
+          breakStaleLock(held.ino);
           continue;
         }
       } catch { /* holder released it between our open and our stat — just retry */ }
