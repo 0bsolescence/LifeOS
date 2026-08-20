@@ -378,40 +378,42 @@ describe("concurrent accepts", () => {
     expect(winner!.stderr).toContain(`by=${fm.accepted_by}`);
   });
 
-  test("the lock is released after a run", () => {
+  test("an accepted manifest leaves exactly one claim marker", () => {
     seed("session-handoff-20260820.md", { ageMinutes: 10 });
-
-    run(["--latest"]);
-
-    expect(readdirSync(work)).not.toContain(".cargo-accept.lock");
-  });
-
-  test("several runs meeting the same abandoned lock still produce one acceptor (codex P2)", async () => {
-    seed("session-handoff-20260820.md", { ageMinutes: 10 });
-    const lock = join(work, ".cargo-accept.lock");
-    writeFileSync(lock, "99999 stale");
-    const old = new Date(Date.now() - 5 * 60_000);
-    utimesSync(lock, old, old);
-
-    const results = await Promise.all(Array.from({ length: 6 }, () => runAsync(["--latest"])));
-
-    expect(results.filter((r) => r.stderr.includes("ACCEPTED")).length).toBe(1);
-    for (const r of results) expect(r.code).toBe(0);
-    expect(readdirSync(work).filter((f) => f.startsWith(".cargo-accept.lock"))).toEqual([]);
-  });
-
-  test("an abandoned lock is broken rather than blocking forever", () => {
-    seed("session-handoff-20260820.md", { ageMinutes: 10 });
-    const lock = join(work, ".cargo-accept.lock");
-    writeFileSync(lock, "99999 stale");
-    const old = new Date(Date.now() - 5 * 60_000);
-    utimesSync(lock, old, old);
 
     const r = run(["--latest"]);
 
     expect(r.code).toBe(0);
-    expect(r.stderr).toContain("ACCEPTED");
-    expect(readdirSync(work)).not.toContain(".cargo-accept.lock");
+    expect(readdirSync(work).filter((f) => f.startsWith(".accepted-")))
+      .toEqual([".accepted-session-handoff-20260820.md"]);
+  });
+
+  test("a claimed manifest is passed over even if a crash left it open", () => {
+    seed("session-handoff-20260819.md", { ageMinutes: 200 });
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+    writeFileSync(join(work, ".accepted-session-handoff-20260820.md"), "node-x 2026-08-20T00:00:00Z");
+
+    const r = run(["--latest"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toBe(join(work, "session-handoff-20260819.md"));
+    expect(stateOf("session-handoff-20260820.md")).toBe("open");
+  });
+
+  test("no lock file is created — there is no staleness rule to get wrong", () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    run(["--latest"]);
+
+    expect(readdirSync(work).filter((f) => f.includes("lock"))).toEqual([]);
+  });
+
+  test("no temp files survive an accept", () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    run(["--latest"]);
+
+    expect(readdirSync(work).filter((f) => f.includes(".tmp"))).toEqual([]);
   });
 });
 

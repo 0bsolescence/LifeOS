@@ -71,7 +71,7 @@
 
 import {
   readFileSync, writeFileSync, statSync, readdirSync, existsSync,
-  renameSync, openSync, closeSync, linkSync, unlinkSync,
+  renameSync, linkSync, unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir, hostname } from "node:os";
@@ -208,14 +208,21 @@ function writeState(h: Handoff, next: Frontmatter): void {
 //   publish  two landings in the same second both pass an existsSync check and
 //            the second rename clobbers the first manifest.
 //
-// Accept is serialised by an exclusive lock file; publish reserves its filename
-// with link(), which fails rather than overwrites when the name is taken.
+// Both are solved with link(), which is atomic and fails rather than overwrites
+// when the name is taken. Publish uses it to claim a filename; accept uses it as
+// a compare-and-set on a per-manifest claim marker.
+//
+// An earlier revision serialised accept with a lock file instead. That was wrong,
+// and three audit passes were spent proving it: a lock needs a staleness rule so
+// an abandoned one cannot wedge the morning summons, and breaking a stale lock
+// safely needs a compare-and-swap on the lock's identity that POSIX does not
+// offer. Whatever the recovery does — unlink, or rename-and-inode-check — a
+// third process can claim the momentarily vacant path and end up sharing the
+// lock with a live owner. The claim marker has no such rule to get wrong: it is
+// created atomically, it is never removed, and there is nothing to time out.
 // ============================================================================
 
-const LOCK_PATH = join(WORK, ".cargo-accept.lock");
-const LOCK_STALE_MS = 30_000;
-const LOCK_WAIT_MS = 10_000;
-const LOCK_POLL_MS = 100;
+const CLAIM_ATTEMPTS = 5;
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -225,61 +232,37 @@ function isEexist(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "EEXIST";
 }
 
-/**
- * Remove an abandoned lock, but only the exact one observed to be stale.
- *
- * A plain unlink here is wrong when several processes see the same stale lock: one
- * removes it and acquires a fresh lock, and the others then unlink the NEW owner's
- * lock on the strength of their old observation, so two of them enter accept() at
- * once (codex review, 2026-08-20). rename() is atomic, so exactly one process moves
- * the file that is currently at the lock path; the inode check then tells us whether
- * we moved the stale lock we meant to or a live one that replaced it. A live one is
- * put back with link(), which declines to overwrite whatever owns the path by then.
- */
-function breakStaleLock(staleIno: number): void {
-  const stolen = `${LOCK_PATH}.stale-${process.pid}-${Date.now()}`;
-  try {
-    renameSync(LOCK_PATH, stolen);
-  } catch {
-    return; // someone else moved it first; go back to competing for the lock
-  }
-  try {
-    if (statSync(stolen).ino !== staleIno) {
-      // We took a live lock. Restore it if the path is still free; if a third process
-      // has since claimed it, dropping ours is correct — that process is the owner.
-      try { linkSync(stolen, LOCK_PATH); } catch { /* claimed in the meantime */ }
-    }
-  } finally {
-    try { unlinkSync(stolen); } catch { /* nothing to clean up */ }
-  }
+/** The durable marker that one process, once, won the right to accept this manifest. */
+function claimPath(h: Handoff): string {
+  return join(WORK, `.accepted-${h.file}`);
 }
 
-/** Run fn holding the exclusive accept lock. A lock older than 30s is presumed abandoned. */
-function withAcceptLock<T>(fn: () => T): T {
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      closeSync(openSync(LOCK_PATH, "wx"));
-      try {
-        return fn();
-      } finally {
-        try { unlinkSync(LOCK_PATH); } catch { /* already gone; nothing to release */ }
-      }
-    } catch (e) {
-      if (!isEexist(e)) throw e;
-      try {
-        const held = statSync(LOCK_PATH);
-        if (Date.now() - held.mtimeMs > LOCK_STALE_MS) {
-          breakStaleLock(held.ino);
-          continue;
-        }
-      } catch { /* holder released it between our open and our stat — just retry */ }
-      if (Date.now() >= deadline) {
-        console.error(`POSTCONDITION FAIL: another accept has held ${LOCK_PATH} for ${LOCK_WAIT_MS}ms`);
-        process.exit(1);
-      }
-      sleepSync(LOCK_POLL_MS);
-    }
+function isClaimed(h: Handoff): boolean {
+  return existsSync(claimPath(h));
+}
+
+/**
+ * Atomically claim the right to accept `h`. Exactly one caller can win, because
+ * link() either creates the marker or fails with EEXIST — there is no window in
+ * which two processes both believe they hold it.
+ *
+ * The marker is never deleted: its existence is the record that this manifest was
+ * consumed. If a run dies between claiming and writing the frontmatter, the manifest
+ * stays open on disk but claimed, and later runs pass over it to the next open one
+ * rather than re-accepting it. Nothing is lost — `--peek` still shows it — and no
+ * staleness rule is needed, which is the point.
+ */
+function claim(h: Handoff, by: string, at: string): boolean {
+  const tmp = join(WORK, `.cargo-claim-${process.pid}-${Date.now()}.tmp`);
+  writeFileSync(tmp, `${by} ${at} pid=${process.pid}\n`);
+  try {
+    linkSync(tmp, claimPath(h));
+    return true;
+  } catch (e) {
+    if (isEexist(e)) return false;
+    throw e;
+  } finally {
+    try { unlinkSync(tmp); } catch { /* the link is what matters; the temp name is not */ }
   }
 }
 
@@ -331,13 +314,13 @@ function flag(name: string): string | undefined {
   return i === -1 ? undefined : process.argv[i + 1];
 }
 
-interface AcceptResult { path: string; notes: string[]; error?: string }
+interface AcceptResult { path: string; notes: string[]; error?: string; contended?: boolean }
 
 function latest(): void {
   if (process.argv.includes("--peek")) {
     const all = listHandoffs();
     if (all.length === 0) { console.error("no handoff files"); process.exit(1); }
-    const open = all.filter((h) => stateOf(h) === "open");
+    const open = all.filter((h) => stateOf(h) === "open" && !isClaimed(h));
     const target = open[0] ?? all[0];
     console.error(
       open.length > 0
@@ -348,9 +331,14 @@ function latest(): void {
     process.exit(0);
   }
 
-  // Everything below mutates state, so it runs under the lock and returns rather than
-  // exiting — process.exit skips finally blocks, which would leak the lock.
-  const result = withAcceptLock(accept);
+  // Mutating paths return rather than exit, so their cleanup always runs.
+  let result = accept();
+  // Losing the claim means another run took this manifest between our read and our
+  // link. Re-read and try the next open one; it is not an error, just contention.
+  for (let attempt = 1; result.contended && attempt < CLAIM_ATTEMPTS; attempt++) {
+    sleepSync(10);
+    result = accept();
+  }
   for (const note of result.notes) console.error(note);
   if (result.error) { console.error(result.error); process.exit(1); }
   console.log(result.path);
@@ -358,11 +346,11 @@ function latest(): void {
 }
 
 function accept(): AcceptResult {
-  // Re-read INSIDE the lock: whatever we saw before acquiring it may be stale.
   const all = listHandoffs();
   if (all.length === 0) return { path: "", notes: [], error: "no handoff files" };
 
-  const open = all.filter((h) => stateOf(h) === "open");
+  // A claimed manifest has been consumed even if a crash left its frontmatter open.
+  const open = all.filter((h) => stateOf(h) === "open" && !isClaimed(h));
 
   if (open.length === 0) {
     // Every handoff has already been consumed. Still hand back the newest so a summons
@@ -378,6 +366,13 @@ function accept(): AcceptResult {
   const acceptedBy = flag("--accepted-by") ?? process.env.LIFEOS_NODE ?? hostname();
   const acceptedAt = new Date().toISOString();
   const session = flag("--session") ?? process.env.CLAUDE_SESSION_ID ?? null;
+
+  // The single point at which one process wins. Nothing below here is reachable by a
+  // second process for this manifest, so the writes need no further serialisation.
+  if (!claim(chosen, acceptedBy, acceptedAt)) {
+    return { path: chosen.path, notes: [], contended: true };
+  }
+
   const chosenNode = nodeOf(chosen);
 
   // Older open manifests from the same node are exactly the shadowing hazard, so they
