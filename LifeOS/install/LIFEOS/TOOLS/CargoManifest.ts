@@ -69,7 +69,10 @@
  * Postcondition printed: path, bytes, row counts. Exit 1 on any shortfall.
  */
 
-import { readFileSync, writeFileSync, statSync, readdirSync, existsSync, renameSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, statSync, readdirSync, existsSync,
+  renameSync, openSync, closeSync, linkSync, unlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir, hostname } from "node:os";
 
@@ -195,6 +198,101 @@ function writeState(h: Handoff, next: Frontmatter): void {
 }
 
 // ============================================================================
+// Concurrency
+//
+// Two ravens landing or summoning at the same moment on one node is ordinary in
+// this estate, and both races lose records (codex review, 2026-08-20):
+//
+//   accept   two --latest runs both read a manifest as open, both accept it, and
+//            the second write silently replaces the first acceptor of record.
+//   publish  two landings in the same second both pass an existsSync check and
+//            the second rename clobbers the first manifest.
+//
+// Accept is serialised by an exclusive lock file; publish reserves its filename
+// with link(), which fails rather than overwrites when the name is taken.
+// ============================================================================
+
+const LOCK_PATH = join(WORK, ".cargo-accept.lock");
+const LOCK_STALE_MS = 30_000;
+const LOCK_WAIT_MS = 10_000;
+const LOCK_POLL_MS = 100;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function isEexist(e: unknown): boolean {
+  return (e as NodeJS.ErrnoException)?.code === "EEXIST";
+}
+
+/** Run fn holding the exclusive accept lock. A lock older than 30s is presumed abandoned. */
+function withAcceptLock<T>(fn: () => T): T {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      closeSync(openSync(LOCK_PATH, "wx"));
+      try {
+        return fn();
+      } finally {
+        try { unlinkSync(LOCK_PATH); } catch { /* already gone; nothing to release */ }
+      }
+    } catch (e) {
+      if (!isEexist(e)) throw e;
+      try {
+        if (Date.now() - statSync(LOCK_PATH).mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(LOCK_PATH);
+          continue;
+        }
+      } catch { /* holder released it between our open and our stat — just retry */ }
+      if (Date.now() >= deadline) {
+        console.error(`POSTCONDITION FAIL: another accept has held ${LOCK_PATH} for ${LOCK_WAIT_MS}ms`);
+        process.exit(1);
+      }
+      sleepSync(LOCK_POLL_MS);
+    }
+  }
+}
+
+const PUBLISH_ATTEMPTS = 12;
+
+/** `YYYYMMDD-HHMMSS`, plus milliseconds when asked. */
+function stampNow(withMs: boolean): string {
+  const iso = new Date().toISOString();
+  const base = iso.slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+  return withMs ? base + iso.slice(20, 23) : base;
+}
+
+/**
+ * Publish `content` under a free filename, claiming it with link(): link is atomic and
+ * fails when the name is taken, where an existsSync check followed by a rename lets two
+ * concurrent landings both believe they won and one silently overwrite the other.
+ *
+ * The first attempt uses the readable second-resolution name. Contended attempts fall
+ * back to millisecond resolution and re-read the clock each time, so a busy millisecond
+ * resolves on the next one. Returns null when every attempt was taken — the caller
+ * reports it, because exiting in here would skip the cleanup of the temp file.
+ */
+function publish(content: string): string | null {
+  const tmp = join(WORK, `.cargo-write-${process.pid}-${Date.now()}.tmp`);
+  writeFileSync(tmp, content);
+  try {
+    for (let attempt = 0; attempt < PUBLISH_ATTEMPTS; attempt++) {
+      const candidate = join(WORK, `session-handoff-${stampNow(attempt > 0)}.md`);
+      try {
+        linkSync(tmp, candidate);
+        return candidate;
+      } catch (e) {
+        if (!isEexist(e)) throw e;
+      }
+      if (attempt > 0) sleepSync(1); // let the clock move past the contended millisecond
+    }
+    return null;
+  } finally {
+    try { unlinkSync(tmp); } catch { /* the link is what matters; the temp name is not */ }
+  }
+}
+
+// ============================================================================
 // --latest: the ACCEPT operation
 // ============================================================================
 
@@ -203,10 +301,36 @@ function flag(name: string): string | undefined {
   return i === -1 ? undefined : process.argv[i + 1];
 }
 
+interface AcceptResult { path: string; notes: string[]; error?: string }
+
 function latest(): void {
-  const peek = process.argv.includes("--peek");
+  if (process.argv.includes("--peek")) {
+    const all = listHandoffs();
+    if (all.length === 0) { console.error("no handoff files"); process.exit(1); }
+    const open = all.filter((h) => stateOf(h) === "open");
+    const target = open[0] ?? all[0];
+    console.error(
+      open.length > 0
+        ? `PEEK: no state changed (${open.length} open, ${all.length} total)`
+        : `PEEK: no open handoff (${all.length} total, state=${stateOf(target)})`,
+    );
+    console.log(target.path);
+    process.exit(0);
+  }
+
+  // Everything below mutates state, so it runs under the lock and returns rather than
+  // exiting — process.exit skips finally blocks, which would leak the lock.
+  const result = withAcceptLock(accept);
+  for (const note of result.notes) console.error(note);
+  if (result.error) { console.error(result.error); process.exit(1); }
+  console.log(result.path);
+  process.exit(0);
+}
+
+function accept(): AcceptResult {
+  // Re-read INSIDE the lock: whatever we saw before acquiring it may be stale.
   const all = listHandoffs();
-  if (all.length === 0) { console.error("no handoff files"); process.exit(1); }
+  if (all.length === 0) return { path: "", notes: [], error: "no handoff files" };
 
   const open = all.filter((h) => stateOf(h) === "open");
 
@@ -214,18 +338,13 @@ function latest(): void {
     // Every handoff has already been consumed. Still hand back the newest so a summons
     // is never blanked, but say plainly that it is not a fresh record.
     const newest = all[0];
-    console.error(`WARN: no open handoff; returning newest (state=${stateOf(newest)}, accepted_by=${newest.fm.accepted_by ?? "—"})`);
-    console.log(newest.path);
-    process.exit(0);
+    return {
+      path: newest.path,
+      notes: [`WARN: no open handoff; returning newest (state=${stateOf(newest)}, accepted_by=${newest.fm.accepted_by ?? "—"})`],
+    };
   }
 
   const chosen = open[0];
-  if (peek) {
-    console.error(`PEEK: no state changed (${open.length} open, ${all.length} total)`);
-    console.log(chosen.path);
-    process.exit(0);
-  }
-
   const acceptedBy = flag("--accepted-by") ?? process.env.LIFEOS_NODE ?? hostname();
   const acceptedAt = new Date().toISOString();
   const session = flag("--session") ?? process.env.CLAUDE_SESSION_ID ?? null;
@@ -256,21 +375,20 @@ function latest(): void {
   const after = listHandoffs();
   const chosenAfter = after.find((h) => h.path === chosen.path);
   if (!chosenAfter || stateOf(chosenAfter) !== "accepted") {
-    console.error("POSTCONDITION FAIL: chosen manifest is not accepted after write");
-    process.exit(1);
+    return { path: chosen.path, notes: [], error: "POSTCONDITION FAIL: chosen manifest is not accepted after write" };
   }
   const stillOpen = superseded.filter((s) => {
     const a = after.find((h) => h.path === s.path);
     return !a || stateOf(a) !== "expired";
   });
   if (stillOpen.length > 0) {
-    console.error(`POSTCONDITION FAIL: ${stillOpen.length} superseded manifest(s) did not expire`);
-    process.exit(1);
+    return { path: chosen.path, notes: [], error: `POSTCONDITION FAIL: ${stillOpen.length} superseded manifest(s) did not expire` };
   }
 
-  console.error(`ACCEPTED by=${acceptedBy} at=${acceptedAt} expired=${superseded.length}`);
-  console.log(chosen.path);
-  process.exit(0);
+  return {
+    path: chosen.path,
+    notes: [`ACCEPTED by=${acceptedBy} at=${acceptedAt} expired=${superseded.length}`],
+  };
 }
 
 // ============================================================================
@@ -332,18 +450,7 @@ function main(): void {
     if (m[k] === undefined) { console.error(`manifest missing required key: ${k}`); process.exit(1); }
   }
 
-  const now = new Date();
-  const iso = now.toISOString();
-  const stamp = iso.slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
-  // Second-resolution filename: two landings in one day used to overwrite each other,
-  // which destroyed the earlier record instead of expiring it. Milliseconds are appended
-  // only to break a same-second collision, so the common filename stays readable.
-  let path = join(WORK, `session-handoff-${stamp}.md`);
-  if (existsSync(path)) path = join(WORK, `session-handoff-${stamp}${iso.slice(20, 23)}.md`);
-  if (existsSync(path)) {
-    console.error(`POSTCONDITION FAIL: ${path} already exists — two manifests in the same millisecond`);
-    process.exit(1);
-  }
+  const iso = new Date().toISOString();
   const fromNode = m.from_node ?? m.node;
 
   const landed = section(m.landed, ["what", "sha", "evidence"], "landed");
@@ -404,9 +511,11 @@ function main(): void {
   const blank = body.split("\n").findIndex((l) => /^-\s*$/.test(l));
   if (blank !== -1) { console.error(`POSTCONDITION FAIL: empty bullet at line ${blank + 1}`); process.exit(1); }
 
-  const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, frontmatter + body);
-  renameSync(tmp, path);
+  const path = publish(frontmatter + body);
+  if (path === null) {
+    console.error(`POSTCONDITION FAIL: no free filename after ${PUBLISH_ATTEMPTS} attempts`);
+    process.exit(1);
+  }
 
   if (!existsSync(path)) { console.error("POSTCONDITION FAIL: file absent after write"); process.exit(1); }
   const bytes = statSync(path).size;

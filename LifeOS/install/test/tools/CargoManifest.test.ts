@@ -328,6 +328,112 @@ describe("--latest accept semantics", () => {
 });
 
 // ============================================================================
+// Concurrency (codex review findings, both P1)
+// ============================================================================
+
+async function runAsync(args: string[], env: Record<string, string> = {}) {
+  const proc = Bun.spawn(["bun", TOOL, ...args], {
+    env: { ...process.env, LIFEOS_WORK_DIR: work, LIFEOS_NODE: "test-node", ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+describe("concurrent accepts", () => {
+  test("exactly one of several simultaneous --latest runs accepts the manifest", async () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    const results = await Promise.all(Array.from({ length: 6 }, () => runAsync(["--latest"])));
+
+    const accepted = results.filter((r) => r.stderr.includes("ACCEPTED"));
+    const sawNoneOpen = results.filter((r) => r.stderr.includes("no open handoff"));
+    expect(accepted.length).toBe(1);
+    expect(accepted.length + sawNoneOpen.length).toBe(6);
+    for (const r of results) expect(r.code).toBe(0);
+    expect(stateOf("session-handoff-20260820.md")).toBe("accepted");
+  });
+
+  test("the acceptor of record is not overwritten by a losing run", async () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    const results = await Promise.all([
+      runAsync(["--latest", "--accepted-by", "node-a", "--session", "sess-a"]),
+      runAsync(["--latest", "--accepted-by", "node-b", "--session", "sess-b"]),
+      runAsync(["--latest", "--accepted-by", "node-c", "--session", "sess-c"]),
+    ]);
+
+    const winner = results.find((r) => r.stderr.includes("ACCEPTED"));
+    expect(winner).toBeDefined();
+
+    const fm = frontmatter(readFileSync(join(work, "session-handoff-20260820.md"), "utf8"));
+    // Whoever won, the file names that one acceptor and one session — never a mix.
+    expect(["node-a", "node-b", "node-c"]).toContain(fm.accepted_by);
+    expect(fm.accepted_session).toBe(fm.accepted_by!.replace("node-", "sess-"));
+    expect(winner!.stderr).toContain(`by=${fm.accepted_by}`);
+  });
+
+  test("the lock is released after a run", () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+
+    run(["--latest"]);
+
+    expect(readdirSync(work)).not.toContain(".cargo-accept.lock");
+  });
+
+  test("an abandoned lock is broken rather than blocking forever", () => {
+    seed("session-handoff-20260820.md", { ageMinutes: 10 });
+    const lock = join(work, ".cargo-accept.lock");
+    writeFileSync(lock, "99999 stale");
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+
+    const r = run(["--latest"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("ACCEPTED");
+    expect(readdirSync(work)).not.toContain(".cargo-accept.lock");
+  });
+});
+
+describe("concurrent landings", () => {
+  test("simultaneous landings each get their own file — none is clobbered", async () => {
+    const paths = Array.from({ length: 5 }, (_, i) => {
+      const p = join(work, `manifest-${i}.json`);
+      writeFileSync(p, JSON.stringify({ ...BASE, landed: [`landing from raven ${i}`] }));
+      return p;
+    });
+
+    const results = await Promise.all(paths.map((p) => runAsync([p])));
+
+    for (const r of results) expect(r.code).toBe(0);
+    expect(manifests().length).toBe(5);
+
+    // Every raven's content survives — the point of the whole exercise.
+    const all = manifests().map((f) => readFileSync(join(work, f), "utf8")).join("\n");
+    for (let i = 0; i < 5; i++) expect(all).toContain(`landing from raven ${i}`);
+  });
+
+  test("no temp or partial files are left behind", async () => {
+    const paths = Array.from({ length: 3 }, (_, i) => {
+      const p = join(work, `m-${i}.json`);
+      writeFileSync(p, JSON.stringify({ ...BASE, landed: [`raven ${i}`] }));
+      return p;
+    });
+
+    await Promise.all(paths.map((p) => runAsync([p])));
+
+    const leftovers = readdirSync(work).filter((f) => f.includes(".tmp") || f.startsWith(".cargo-write"));
+    expect(leftovers).toEqual([]);
+  });
+});
+
+// ============================================================================
 // A1 — backward compatibility
 // ============================================================================
 
