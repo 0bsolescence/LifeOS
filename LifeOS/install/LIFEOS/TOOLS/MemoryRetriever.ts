@@ -24,7 +24,9 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  *   bun MemoryRetriever.ts --help                            # Show usage
  *
  * SEARCH:
- *   BM25-style keyword matching + tag co-occurrence scoring.
+ *   BM25-style keyword matching + tag co-occurrence scoring, then a bounded
+ *   authority multiplier ([0.8, 1.3]) from the kb-v3 envelope — see the
+ *   Authority weighting block below. LIFEOS_AUTHORITY_WEIGHTING=off disables it.
  *   No embeddings, no vector DB — pure markdown + YAML frontmatter.
  *
  * COMPRESSION:
@@ -66,6 +68,72 @@ const BM25_B = 0.75;
 const TITLE_MATCH_WEIGHT = 10;
 const TAG_MATCH_WEIGHT = 5;
 const RELATED_MATCH_WEIGHT = 3;
+
+// ============================================================================
+// Authority weighting (A2, 2026-08-20) — adopted from ai-memory's bounded
+// "authority adjustment", which favours durable rules and decisions over
+// episodic pages when relevance is otherwise comparable.
+//
+// The multiplier reads kb-v3 envelope fields already on disk (status, quality,
+// type) and scales the BM25 relevance score. It is an ADJUSTMENT, NEVER A
+// FILTER: a low-authority note that matches well still outranks a high-authority
+// note that does not, because the ceiling (1.3) is far below the gap that title
+// and tag matches open. Nothing is ever excluded for its envelope alone.
+//
+// Bounds are deliberately tight. The product of the three factors is clamped to
+// [0.8, 1.3], so authority can reorder near-ties and cannot manufacture a hit.
+// Note that a 0.8 multiplier can push a marginal note under the 0.20 relevance
+// threshold used by getRelevantContext — that is the intended effect at the
+// margin, not a filter, and it is bounded by the same clamp.
+//
+// Set LIFEOS_AUTHORITY_WEIGHTING=off to score on pure BM25 (A/B, debugging).
+// ============================================================================
+
+const AUTHORITY_MIN = 0.8;
+const AUTHORITY_MAX = 1.3;
+
+/** Curation lifecycle: an evergreen note has survived review; an inbox note has not been read. */
+const STATUS_AUTHORITY: Record<string, number> = {
+  evergreen: 1.15,
+  budding: 1.05,
+  seedling: 0.92,
+  inbox: 0.88,
+};
+
+/**
+ * Type authority. The curated hot layer and durable claims sit above captured
+ * external sources; entity notes are neutral. Kept mild — type is the weakest of
+ * the three signals and the easiest to be wrong about.
+ */
+const TYPE_AUTHORITY: Record<string, number> = {
+  memory: 1.10,
+  idea: 1.05,
+  research: 1.05,
+  blog: 0.95,
+};
+
+/** quality is a required envelope field on a 1–5 scale; missing or unparseable is neutral. */
+function qualityAuthority(raw: unknown): number {
+  const q = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  if (!Number.isFinite(q)) return 1.0;
+  if (q >= 4) return 1.08;
+  if (q <= 2) return 0.94;
+  return 1.0;
+}
+
+/**
+ * Bounded authority multiplier for a note's BM25 score, in [0.8, 1.3].
+ * A note with no envelope fields scores exactly 1.0 — unweighted, not penalised.
+ */
+export function authorityMultiplier(frontmatter: Frontmatter): number {
+  if (process.env.LIFEOS_AUTHORITY_WEIGHTING === "off") return 1.0;
+
+  const status = typeof frontmatter.status === "string" ? frontmatter.status.toLowerCase() : "";
+  const type = typeof frontmatter.type === "string" ? frontmatter.type.toLowerCase() : "";
+
+  const raw = (STATUS_AUTHORITY[status] ?? 1.0) * qualityAuthority(frontmatter.quality) * (TYPE_AUTHORITY[type] ?? 1.0);
+  return Math.min(AUTHORITY_MAX, Math.max(AUTHORITY_MIN, raw));
+}
 
 // Defaults
 const DEFAULT_TOP = 3;
@@ -288,7 +356,8 @@ function scoreNote(
     }
   }
 
-  return score;
+  // A note that matched nothing stays at zero — authority never manufactures a hit.
+  return score === 0 ? 0 : score * authorityMultiplier(note.frontmatter);
 }
 
 // ============================================================================
