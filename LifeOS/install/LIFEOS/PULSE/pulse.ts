@@ -100,6 +100,7 @@ let usageModule: any = null
 let bunkerModule: any = null
 let contentModule: any = null
 let doctorModule: any = null
+let diskguardModule: any = null
 let algorithmTabModule: any = null
 let evalsModule: any = null
 let hermesModule: any = null
@@ -310,6 +311,17 @@ async function loadModules(config: PulseConfig) {
   } catch (err) {
     log("warn", "Doctor module not available", { error: String(err) })
   }
+  // DiskGuard — deterministic disk-usage threshold check: root df + a watch
+  // list that always includes /var/snap/<name>/common (the snap data roots
+  // that twice filled a node invisibly).
+  if (config.diskguard?.enabled !== false) {
+    try {
+      diskguardModule = await import("./modules/diskguard")
+      if (diskguardModule.start) await diskguardModule.start()
+    } catch (err) {
+      log("warn", "DiskGuard module not available", { error: String(err) })
+    }
+  }
   // Hermes — the sidecar's core files: SOUL, config, guard policy, and the code
   // that generates them. Read/edit surface behind the Assistant tab.
   try {
@@ -353,6 +365,7 @@ interface PulseConfig {
   telos?: { enabled: boolean; [key: string]: unknown }
   hypotheses?: { enabled: boolean; [key: string]: unknown }
   upgrades?: { enabled: boolean; [key: string]: unknown }
+  diskguard?: { enabled: boolean; [key: string]: unknown }
   worker?: { name: string; [key: string]: unknown }
   jobs: Array<{
     name: string
@@ -399,6 +412,7 @@ async function loadPulseConfig(): Promise<PulseConfig> {
     bunker: (parsed.bunker as PulseConfig["bunker"]) ?? { enabled: true },
     content: (parsed.content as PulseConfig["content"]) ?? { enabled: true },
     telos: (parsed.telos as PulseConfig["telos"]) ?? { enabled: true },
+    diskguard: (parsed.diskguard as PulseConfig["diskguard"]) ?? { enabled: true },
     hooks: (parsed.hooks as PulseConfig["hooks"]) ?? { enabled: true },
     da,
     worker: parsed.worker as PulseConfig["worker"],
@@ -523,6 +537,12 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
     subsystems.syslog = syslogModule.health()
   }
 
+  // DiskGuard — surfaces in reasons at critical: a filling disk is exactly
+  // the condition this daemon exists to make loud before writes start failing.
+  if (diskguardModule && config.diskguard?.enabled !== false) {
+    subsystems.diskguard = diskguardModule.health()
+  }
+
   // Dashboard assets (content-liveness, not just process-liveness)
   const dash = dashboardHealth(config)
   subsystems.dashboard = dash
@@ -532,6 +552,10 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
   const reasons: string[] = []
   if (dash.status === "missing") {
     reasons.push(`dashboard build missing: ${dash.indexPath} — run: cd ${PULSE_DIR}/Observability && bun install && bun run build`)
+  }
+  const dg = subsystems.diskguard as { status: string; details?: { rootUsedPercent?: number | null } } | undefined
+  if (dg?.status === "critical") {
+    reasons.push(`diskguard: root filesystem at ${dg.details?.rootUsedPercent ?? "?"}% (critical)`)
   }
   // Only enabled jobs count toward degraded — a disabled job's stale failure
   // counter would otherwise pin healthz at "degraded" forever.
@@ -916,6 +940,12 @@ async function main() {
       // Doctor API: /api/doctor (System Health — capabilities, heartbeat, hook reconcile)
       if (doctorModule && pathname.startsWith("/api/doctor")) {
         const resp = await doctorModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
+      // DiskGuard API: /api/diskguard (root df thresholds + snap-common watch list)
+      if (diskguardModule && pathname.startsWith("/api/diskguard")) {
+        const resp = await diskguardModule.handleRequest(req, pathname)
         if (resp) return resp
       }
 

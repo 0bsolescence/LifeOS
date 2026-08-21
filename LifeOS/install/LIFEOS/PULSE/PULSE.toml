@@ -88,6 +88,19 @@ enabled = true
 #            /api/telos/freshness/summary, /api/telos/health.
 # Read-only — bumps go through skills/Interview which calls bumpTelosTimestamp().
 
+[diskguard]
+enabled = true
+# Deterministic disk-usage threshold check. Root filesystem via `df -P -k /`;
+# watch list is every /var/snap/<name>/common present on the host (snap data
+# roots hide from the owning daemon's accounting and from unprivileged du)
+# plus any extra paths listed here. A path unreadable without privilege is
+# reported as exactly that, never as 0.
+warn_percent = 80
+critical_percent = 90
+watch_paths = []
+check_interval_seconds = 300
+du_timeout_ms = 30000
+
 [da]
 enabled = true
 # DA display name (placeholder). Canonical name lives in LIFEOS/USER/CONFIG/LIFEOS_CONFIG.toml [da].name.
