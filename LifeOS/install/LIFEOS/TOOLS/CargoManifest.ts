@@ -278,22 +278,46 @@ function orderMs(h: Handoff): number {
   return h.mtimeMs;
 }
 
+/**
+ * Composite lifecycle order: created-time first, filename as the deterministic
+ * tie-breaker. Barriers compare with the SAME composite the ranking sorts by —
+ * a strict millisecond comparison alone would permanently swallow a handoff
+ * published in the claimed one's millisecond (codex review, 2026-08-21).
+ */
+interface LifecycleOrder { ms: number; file: string }
+const ORDER_FLOOR: LifecycleOrder = { ms: -Infinity, file: "" };
+
+function orderOf(h: Handoff): LifecycleOrder {
+  return { ms: orderMs(h), file: h.file };
+}
+
+function orderAfter(a: LifecycleOrder, b: LifecycleOrder): boolean {
+  return a.ms > b.ms || (a.ms === b.ms && a.file.localeCompare(b.file) > 0);
+}
+
+function orderMax(a: LifecycleOrder, b: LifecycleOrder): LifecycleOrder {
+  return orderAfter(a, b) ? a : b;
+}
+
 function eligibleOpen(all: Handoff[]): Handoff[] {
-  const claimedAt = new Map<string, number>();
-  let unattributedClaim = -Infinity;
+  const claimedAt = new Map<string, LifecycleOrder>();
+  let unattributedClaim = ORDER_FLOOR;
   for (const h of all) {
     if (!isClaimed(h)) continue;
     const n = nodeOf(h);
-    if (n === null) unattributedClaim = Math.max(unattributedClaim, orderMs(h));
-    else claimedAt.set(n, Math.max(claimedAt.get(n) ?? -Infinity, orderMs(h)));
+    if (n === null) unattributedClaim = orderMax(unattributedClaim, orderOf(h));
+    else claimedAt.set(n, orderMax(claimedAt.get(n) ?? ORDER_FLOOR, orderOf(h)));
   }
-  const anyClaim = Math.max(unattributedClaim, ...claimedAt.values());
+  let anyClaim = unattributedClaim;
+  for (const v of claimedAt.values()) anyClaim = orderMax(anyClaim, v);
 
   return all.filter((h) => {
     if (stateOf(h) !== "open" || isClaimed(h)) return false;
     const n = nodeOf(h);
-    const barrier = n === null ? anyClaim : Math.max(claimedAt.get(n) ?? -Infinity, unattributedClaim);
-    return orderMs(h) > barrier;
+    const barrier = n === null
+      ? anyClaim
+      : orderMax(claimedAt.get(n) ?? ORDER_FLOOR, unattributedClaim);
+    return orderAfter(orderOf(h), barrier);
   // The caller accepts [0] and expires the rest, so the ranking must ride the
   // same immutable order as the barrier — an mtime scrambled by restore/sync/
   // touch must not decide which handoff wins (codex review, 2026-08-21).
