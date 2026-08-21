@@ -175,6 +175,22 @@ describe("interpretDu", () => {
     expect(r.note).toContain("at least");
   });
 
+  test("permission-denied with a zero size collapses to unreadable — a 0 floor is no information", () => {
+    // Real GNU du prints "0\t<path>" even for a fully-denied tree; reporting
+    // that as "0 B" is exactly the fabricated number the honesty contract bans.
+    const r = interpretDu(
+      du({
+        exitCode: 1,
+        stdout: "0\t/var/snap/docker/common\n",
+        stderr: "du: cannot read directory '/var/snap/docker/common': Permission denied\n",
+      }),
+      P,
+    );
+    expect(r.verified).toBe(false);
+    expect(r.bytes).toBeNull();
+    expect(r.note).toBe("unreadable without privilege");
+  });
+
   test("permission-denied with no size at all reports unreadable without privilege", () => {
     const r = interpretDu(
       du({ exitCode: 1, stderr: "du: cannot read directory '/var/snap/docker/common': Permission denied\n" }),

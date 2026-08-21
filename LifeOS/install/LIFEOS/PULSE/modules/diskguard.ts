@@ -178,7 +178,10 @@ export function interpretDu(res: CmdResult, path: string): WatchPathReport {
   if (res.exitCode === 0 && kb !== null) {
     return { ...base, bytes: kb * 1024, human: formatBytes(kb * 1024), verified: true, note: null };
   }
-  if (denied && kb !== null) {
+  // GNU du prints a size line even when the whole tree is denied — a 0 floor
+  // is no information, so only a nonzero partial counts as a floor. (Verified
+  // live 2026-08-21: du on a mode-000 dir exits 1 with stdout "0\t<path>".)
+  if (denied && kb !== null && kb > 0) {
     return {
       ...base,
       bytes: kb * 1024,
@@ -218,9 +221,17 @@ interface CheckReport {
   watchPaths: WatchPathReport[];
 }
 
-const state: { running: boolean; config: DiskGuardConfig; report: CheckReport | null; timer: Timer | null } = {
+const state: {
+  running: boolean;
+  /** Raw [diskguard] TOML section; null until first read. Kept raw so every
+   *  check re-resolves against a fresh snap-dir discovery — a snap installed
+   *  after boot joins the watch list without a restart. */
+  section: Record<string, unknown> | undefined | null;
+  report: CheckReport | null;
+  timer: Timer | null;
+} = {
   running: false,
-  config: DEFAULTS,
+  section: null,
   report: null,
   timer: null,
 };
@@ -241,19 +252,22 @@ async function runCmd(cmd: string[], timeoutMs: number): Promise<CmdResult> {
   return { exitCode, stdout, stderr, timedOut };
 }
 
-function loadConfigFromToml(): DiskGuardConfig {
-  let section: Record<string, unknown> | undefined;
+function loadSection(): Record<string, unknown> | undefined {
   try {
     const raw = readFileSync(join(PULSE_DIR, "PULSE.toml"), "utf8");
-    section = parseConfigToml(raw).diskguard as Record<string, unknown> | undefined;
+    return parseConfigToml(raw).diskguard as Record<string, unknown> | undefined;
   } catch {
-    section = undefined;
+    return undefined;
   }
-  return resolveConfig(section, discoverSnapCommonDirs());
+}
+
+function currentConfig(): DiskGuardConfig {
+  if (state.section === null) state.section = loadSection();
+  return resolveConfig(state.section, discoverSnapCommonDirs());
 }
 
 async function runCheck(): Promise<CheckReport> {
-  const cfg = state.config;
+  const cfg = currentConfig();
   const checkedAt = new Date().toISOString();
 
   let root: CheckReport["root"] = null;
@@ -290,15 +304,16 @@ async function runCheck(): Promise<CheckReport> {
 }
 
 export async function start(): Promise<void> {
-  state.config = loadConfigFromToml();
+  state.section = loadSection();
+  const cfg = currentConfig();
   state.running = true;
   // First check off the boot path — a slow du must not delay server startup.
   runCheck().catch((err) => console.error(`[${MODULE_NAME}] initial check failed: ${err}`));
   state.timer = setInterval(() => {
     runCheck().catch((err) => console.error(`[${MODULE_NAME}] check failed: ${err}`));
-  }, state.config.checkIntervalSeconds * 1000);
+  }, cfg.checkIntervalSeconds * 1000);
   console.log(
-    `[${MODULE_NAME}] started — warn ${state.config.warnPercent}% / critical ${state.config.criticalPercent}%, watching ${state.config.watchPaths.length} path(s)`,
+    `[${MODULE_NAME}] started — warn ${cfg.warnPercent}% / critical ${cfg.criticalPercent}%, watching ${cfg.watchPaths.length} path(s)`,
   );
 }
 
