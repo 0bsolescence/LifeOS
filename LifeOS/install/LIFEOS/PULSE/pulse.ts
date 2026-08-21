@@ -1134,6 +1134,9 @@ async function main() {
   if (imessageModule) imessageModule.stopIMessage?.()
   if (assistantModule) assistantModule.stopAssistant?.()
   if (syslogModule) await syslogModule.stop?.()
+  // DiskGuard holds a referenced setInterval — unstopped it keeps firing du
+  // sweeps while the process is trying to exit.
+  if (diskguardModule) await diskguardModule.stop?.()
   await writeState(STATE_PATH, state).catch(() => {})
   log("info", "LifeOS Pulse stopped", { uptimeMs: Date.now() - state.startedAt })
 }

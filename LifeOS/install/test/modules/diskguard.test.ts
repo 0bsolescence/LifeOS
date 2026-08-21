@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -19,6 +19,12 @@ import {
   interpretDu,
   formatBytes,
   discoverSnapCommonDirs,
+  start,
+  stop,
+  health,
+  handleRequest,
+  __setRuntimeDepsForTests,
+  __inspectRuntimeForTests,
   type DiskGuardConfig,
 } from "../../LIFEOS/PULSE/modules/diskguard";
 
@@ -250,5 +256,188 @@ describe("discoverSnapCommonDirs", () => {
 
   test("a missing snap root yields an empty list, not an error", () => {
     expect(discoverSnapCommonDirs(join(root, "does-not-exist"))).toEqual([]);
+  });
+});
+
+// ── Runtime: lifecycle and concurrency ──
+//
+// These drive the real start/stop/handleRequest surface with every host touch
+// (df, du, PULSE.toml, /var/snap, existence checks) replaced, so they assert
+// runtime behaviour without reading a byte of the host's actual disk usage.
+
+const DF_OK = {
+  exitCode: 0,
+  stdout: [
+    "Filesystem     1024-blocks      Used Available Capacity Mounted on",
+    "/dev/sda1            100000     57000     43000      57% /",
+    "",
+  ].join("\n"),
+  stderr: "",
+  timedOut: false,
+};
+
+/** Let already-resolved promise chains drain before asserting. */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+const stateRequest = () => new Request("http://127.0.0.1:31337/api/diskguard");
+const refreshRequest = () => new Request("http://127.0.0.1:31337/api/diskguard?refresh=1");
+
+describe("runtime lifecycle", () => {
+  let snapRoot: string;
+
+  beforeEach(() => {
+    snapRoot = mkdtempSync(join(tmpdir(), "diskguard-runtime-"));
+    __setRuntimeDepsForTests({
+      runCmd: async () => DF_OK,
+      loadSection: () => ({}),
+      snapRoot,
+      exists: () => false,
+    });
+  });
+
+  afterEach(async () => {
+    await stop();
+    await settle();
+    __setRuntimeDepsForTests(null);
+    rmSync(snapRoot, { recursive: true, force: true });
+  });
+
+  test("start arms the periodic check and stop disarms it", async () => {
+    expect(__inspectRuntimeForTests().timerArmed).toBe(false);
+
+    await start();
+    await settle();
+    const started = __inspectRuntimeForTests();
+    expect(started.timerArmed).toBe(true);
+    expect(started.running).toBe(true);
+
+    // The Pulse cleanup path calls this; an uncleared interval keeps firing du
+    // sweeps and keeps the process referenced through shutdown.
+    await stop();
+    const stopped = __inspectRuntimeForTests();
+    expect(stopped.timerArmed).toBe(false);
+    expect(stopped.running).toBe(false);
+    expect(health().status).toBe("stopped");
+  });
+
+  test("stop is idempotent — a second call leaves the timer disarmed", async () => {
+    await start();
+    await settle();
+    await stop();
+    await stop();
+    expect(__inspectRuntimeForTests().timerArmed).toBe(false);
+  });
+});
+
+describe("concurrent check coalescing", () => {
+  let snapRoot: string;
+  let dfCalls: number;
+  let release: () => void;
+  let gate: Promise<void>;
+
+  beforeEach(() => {
+    snapRoot = mkdtempSync(join(tmpdir(), "diskguard-coalesce-"));
+    dfCalls = 0;
+    gate = new Promise<void>((r) => {
+      release = r;
+    });
+    __setRuntimeDepsForTests({
+      loadSection: () => ({}),
+      snapRoot,
+      exists: () => false,
+      runCmd: async (cmd) => {
+        if (cmd[0] === "df") dfCalls++;
+        await gate;
+        return DF_OK;
+      },
+    });
+  });
+
+  afterEach(async () => {
+    release();
+    await stop();
+    await settle();
+    __setRuntimeDepsForTests(null);
+    rmSync(snapRoot, { recursive: true, force: true });
+  });
+
+  test("two concurrent refreshes run one scan and share its report", async () => {
+    const first = handleRequest(refreshRequest(), "/api/diskguard");
+    expect(__inspectRuntimeForTests().checkInFlight).toBe(true);
+    const second = handleRequest(refreshRequest(), "/api/diskguard");
+
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    // One df spawn means one du sweep per watch path, not two — the whole
+    // point: refresh pressure must not multiply I/O on a box short of headroom.
+    expect(dfCalls).toBe(1);
+
+    const reportA = await a!.json();
+    const reportB = await b!.json();
+    expect(reportA.checkedAt).toBe(reportB.checkedAt);
+    expect(reportA.root.usedPercent).toBe(57);
+  });
+
+  test("a refresh arriving during the boot check joins it rather than spawning a second", async () => {
+    await start();
+    expect(dfCalls).toBe(1);
+
+    const joined = handleRequest(refreshRequest(), "/api/diskguard");
+    expect(dfCalls).toBe(1);
+
+    release();
+    const resp = await joined;
+    expect(resp!.status).toBe(200);
+    expect(dfCalls).toBe(1);
+  });
+
+  test("the in-flight slot clears, so a later refresh runs a fresh scan", async () => {
+    const first = handleRequest(refreshRequest(), "/api/diskguard");
+    release();
+    await first;
+    await settle();
+    expect(__inspectRuntimeForTests().checkInFlight).toBe(false);
+
+    await handleRequest(refreshRequest(), "/api/diskguard");
+    expect(dfCalls).toBe(2);
+  });
+
+  test("a plain state read serves the cached report without starting a scan", async () => {
+    release();
+    await handleRequest(refreshRequest(), "/api/diskguard");
+    await settle();
+    expect(dfCalls).toBe(1);
+
+    const cached = await handleRequest(stateRequest(), "/api/diskguard");
+    expect(cached!.status).toBe(200);
+    expect(dfCalls).toBe(1);
+  });
+
+  test("a failed scan releases the slot instead of pinning it forever", async () => {
+    __setRuntimeDepsForTests({
+      loadSection: () => ({}),
+      snapRoot,
+      exists: () => false,
+      runCmd: async () => {
+        throw new Error("df exploded");
+      },
+    });
+
+    await expect(handleRequest(refreshRequest(), "/api/diskguard")).rejects.toThrow("df exploded");
+    await settle();
+    expect(__inspectRuntimeForTests().checkInFlight).toBe(false);
+  });
+});
+
+// ── Pulse shutdown wiring ──
+
+describe("pulse.ts cleanup path", () => {
+  test("stops DiskGuard alongside the other modules that expose stop()", () => {
+    const src = readFileSync(join(import.meta.dir, "..", "..", "LIFEOS", "PULSE", "pulse.ts"), "utf8");
+    const marker = "── Cleanup ──";
+    expect(src).toContain(marker);
+    const cleanup = src.slice(src.lastIndexOf(marker));
+    // The interval start() arms is only ever cleared from here.
+    expect(cleanup).toContain("diskguardModule.stop");
   });
 });

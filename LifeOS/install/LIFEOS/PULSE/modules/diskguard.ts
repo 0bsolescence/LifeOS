@@ -229,14 +229,29 @@ const state: {
   section: Record<string, unknown> | undefined | null;
   report: CheckReport | null;
   timer: Timer | null;
+  /** The one check currently running, if any. See checkOnce(). */
+  inFlight: Promise<CheckReport> | null;
 } = {
   running: false,
   section: null,
   report: null,
   timer: null,
+  inFlight: null,
 };
 
-async function runCmd(cmd: string[], timeoutMs: number): Promise<CmdResult> {
+/**
+ * Every host touch the runtime makes, in one place, so the test suite can swap
+ * the whole set and never depend on real disk state. Production never replaces
+ * these — see __setRuntimeDepsForTests.
+ */
+interface RuntimeDeps {
+  runCmd: (cmd: string[], timeoutMs: number) => Promise<CmdResult>;
+  loadSection: () => Record<string, unknown> | undefined;
+  snapRoot: string;
+  exists: (path: string) => boolean;
+}
+
+async function spawnCmd(cmd: string[], timeoutMs: number): Promise<CmdResult> {
   const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -252,7 +267,7 @@ async function runCmd(cmd: string[], timeoutMs: number): Promise<CmdResult> {
   return { exitCode, stdout, stderr, timedOut };
 }
 
-function loadSection(): Record<string, unknown> | undefined {
+function readTomlSection(): Record<string, unknown> | undefined {
   try {
     const raw = readFileSync(join(PULSE_DIR, "PULSE.toml"), "utf8");
     return parseConfigToml(raw).diskguard as Record<string, unknown> | undefined;
@@ -261,9 +276,18 @@ function loadSection(): Record<string, unknown> | undefined {
   }
 }
 
+const PRODUCTION_DEPS: RuntimeDeps = {
+  runCmd: spawnCmd,
+  loadSection: readTomlSection,
+  snapRoot: SNAP_ROOT,
+  exists: existsSync,
+};
+
+let deps: RuntimeDeps = PRODUCTION_DEPS;
+
 function currentConfig(): DiskGuardConfig {
-  if (state.section === null) state.section = loadSection();
-  return resolveConfig(state.section, discoverSnapCommonDirs());
+  if (state.section === null) state.section = deps.loadSection();
+  return resolveConfig(state.section, discoverSnapCommonDirs(deps.snapRoot));
 }
 
 async function runCheck(): Promise<CheckReport> {
@@ -272,7 +296,7 @@ async function runCheck(): Promise<CheckReport> {
 
   let root: CheckReport["root"] = null;
   let rootNote: string | null = null;
-  const dfRes = await runCmd(["df", "-P", "-k", "/"], 10_000);
+  const dfRes = await deps.runCmd(["df", "-P", "-k", "/"], 10_000);
   const entries = parseDfPosix(dfRes.stdout);
   if (dfRes.exitCode === 0 && entries.length > 0) {
     root = { ...entries[0], level: classifyPercent(entries[0].usedPercent, cfg) };
@@ -284,11 +308,11 @@ async function runCheck(): Promise<CheckReport> {
 
   const watchPaths: WatchPathReport[] = [];
   for (const p of cfg.watchPaths) {
-    if (!existsSync(p)) {
+    if (!deps.exists(p)) {
       watchPaths.push({ path: p, present: false, bytes: null, human: null, verified: false, note: "path not present on this host" });
       continue;
     }
-    watchPaths.push(interpretDu(await runCmd(["du", "-s", "-k", p], cfg.duTimeoutMs), p));
+    watchPaths.push(interpretDu(await deps.runCmd(["du", "-s", "-k", p], cfg.duTimeoutMs), p));
   }
 
   const report: CheckReport = {
@@ -303,20 +327,46 @@ async function runCheck(): Promise<CheckReport> {
   return report;
 }
 
+/**
+ * The only way a check is ever started. A `du` sweep over a snap data root can
+ * run for tens of seconds, so an interval tick landing on top of a `?refresh=1`
+ * (or a burst of refreshes) would otherwise fan out into concurrent du
+ * processes — I/O pressure on exactly the box already short of headroom.
+ * Callers arriving mid-scan await the scan already running and get its report;
+ * a refresh is a request for a check that ends after it was asked for, which
+ * the in-flight one satisfies.
+ */
+function checkOnce(): Promise<CheckReport> {
+  if (state.inFlight) return state.inFlight;
+  // Release the slot once the scan settles, success or failure, so the next
+  // caller starts a fresh check rather than re-reading a finished promise.
+  const p: Promise<CheckReport> = runCheck().finally(() => {
+    if (state.inFlight === p) state.inFlight = null;
+  });
+  state.inFlight = p;
+  return p;
+}
+
 export async function start(): Promise<void> {
-  state.section = loadSection();
+  state.section = deps.loadSection();
   const cfg = currentConfig();
   state.running = true;
   // First check off the boot path — a slow du must not delay server startup.
-  runCheck().catch((err) => console.error(`[${MODULE_NAME}] initial check failed: ${err}`));
+  checkOnce().catch((err) => console.error(`[${MODULE_NAME}] initial check failed: ${err}`));
   state.timer = setInterval(() => {
-    runCheck().catch((err) => console.error(`[${MODULE_NAME}] check failed: ${err}`));
+    checkOnce().catch((err) => console.error(`[${MODULE_NAME}] check failed: ${err}`));
   }, cfg.checkIntervalSeconds * 1000);
   console.log(
     `[${MODULE_NAME}] started — warn ${cfg.warnPercent}% / critical ${cfg.criticalPercent}%, watching ${cfg.watchPaths.length} path(s)`,
   );
 }
 
+/**
+ * Called from Pulse's cleanup path on SIGTERM/SIGINT. Without it the interval
+ * keeps a reference alive and keeps firing du sweeps through shutdown.
+ * A check already in flight is left to finish — its du process is already
+ * spawned, and it clears its own slot.
+ */
 export async function stop(): Promise<void> {
   state.running = false;
   if (state.timer) clearInterval(state.timer);
@@ -346,9 +396,36 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
   const sub = pathname.replace(/^\/api\/diskguard/, "") || "/";
   if (sub === "/" || sub === "/state") {
     const refresh = new URL(req.url).searchParams.get("refresh") === "1";
-    const report = !state.report || refresh ? await runCheck() : state.report;
+    const report = !state.report || refresh ? await checkOnce() : state.report;
     return Response.json(report);
   }
   if (sub === "/status" || sub === "/health") return Response.json(health());
   return null;
+}
+
+// ── Test seams (never called in production) ──
+
+/**
+ * Swap the module's host I/O — df/du spawn, PULSE.toml read, snap root,
+ * existence checks — so a suite exercises the runtime without reading real
+ * disk state. Pass null to restore production behaviour.
+ */
+export function __setRuntimeDepsForTests(over: Partial<RuntimeDeps> | null): void {
+  deps = over ? { ...PRODUCTION_DEPS, ...over } : PRODUCTION_DEPS;
+  // Drop anything cached under the previous deps so each case starts clean.
+  state.section = null;
+  state.report = null;
+}
+
+/** Runtime facts the public surface doesn't expose: timer armed, check in flight. */
+export function __inspectRuntimeForTests(): {
+  running: boolean;
+  timerArmed: boolean;
+  checkInFlight: boolean;
+} {
+  return {
+    running: state.running,
+    timerArmed: state.timer !== null,
+    checkInFlight: state.inFlight !== null,
+  };
 }
