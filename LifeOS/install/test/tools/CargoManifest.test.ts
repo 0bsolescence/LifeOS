@@ -278,6 +278,31 @@ describe("--latest accept semantics", () => {
     expect(r.stderr).toContain("expired=0");
   });
 
+  test("an accept's own mtime bump cannot hide a concurrently published newer handoff", () => {
+    // codex review 2026-08-21 (P1): writeState's rewrite stamps the accepted file
+    // with a fresher mtime than a handoff published while the accept was in
+    // flight. Ordering must ride the immutable `created`, not mtime.
+    seed("session-handoff-20260819.md", { ageMinutes: 200 });
+    run(["--latest"]); // accept rewrites the file — now the newest mtime in WORK
+
+    const late = join(work, "session-handoff-20260821.md");
+    writeFileSync(late, [
+      "---", "handoff: pai-handoff-v1", "node: l7440", "from_node: l7440",
+      "created: 2026-08-21T09:00:00.000Z", "state: open",
+      "accepted_by: ", "accepted_at: ", "accepted_session: ", "---",
+      "# Cargo manifest — 2026-08-21T09:00:00.000Z (l7440)", "",
+      "## LANDED (complete, evidence in hand)", "", "- something real", "",
+    ].join("\n"));
+    const older = new Date(Date.now() - 120_000);
+    utimesSync(late, older, older);
+
+    const r = run(["--latest"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toBe(late);
+    expect(stateOf("session-handoff-20260821.md")).toBe("accepted");
+  });
+
   test("accepting is single-use: a second call finds nothing open and says so", () => {
     seed("session-handoff-20260820.md", { ageMinutes: 10 });
 

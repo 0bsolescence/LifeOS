@@ -257,14 +257,33 @@ function isClaimed(h: Handoff): boolean {
  * A manifest whose node cannot be determined is blocked by any claim at all, matching
  * the expiry rule: an un-attributable handoff is the dangerous case, not the safe one.
  */
+/**
+ * Immutable ordering timestamp for claim barriers. mtime is mutated by the
+ * accept itself (writeState's rename), so an accept racing a fresh publish
+ * could stamp the CLAIMED manifest newer than the genuinely newer open one and
+ * hide it forever (codex review, 2026-08-21). Frontmatter `created` is written
+ * once at publish; the filename timestamp is the fallback; mtime is last resort
+ * for legacy files that carry neither.
+ */
+function orderMs(h: Handoff): number {
+  const fm = h.fm.created ? Date.parse(h.fm.created) : NaN;
+  if (Number.isFinite(fm)) return fm;
+  const m = h.file.match(/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  if (m) {
+    const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`);
+    if (Number.isFinite(t)) return t;
+  }
+  return h.mtimeMs;
+}
+
 function eligibleOpen(all: Handoff[]): Handoff[] {
   const claimedAt = new Map<string, number>();
   let unattributedClaim = -Infinity;
   for (const h of all) {
     if (!isClaimed(h)) continue;
     const n = nodeOf(h);
-    if (n === null) unattributedClaim = Math.max(unattributedClaim, h.mtimeMs);
-    else claimedAt.set(n, Math.max(claimedAt.get(n) ?? -Infinity, h.mtimeMs));
+    if (n === null) unattributedClaim = Math.max(unattributedClaim, orderMs(h));
+    else claimedAt.set(n, Math.max(claimedAt.get(n) ?? -Infinity, orderMs(h)));
   }
   const anyClaim = Math.max(unattributedClaim, ...claimedAt.values());
 
@@ -272,7 +291,7 @@ function eligibleOpen(all: Handoff[]): Handoff[] {
     if (stateOf(h) !== "open" || isClaimed(h)) return false;
     const n = nodeOf(h);
     const barrier = n === null ? anyClaim : Math.max(claimedAt.get(n) ?? -Infinity, unattributedClaim);
-    return h.mtimeMs > barrier;
+    return orderMs(h) > barrier;
   });
 }
 
