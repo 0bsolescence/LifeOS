@@ -66,9 +66,10 @@ function seed(name: string, opts: { node?: string; state?: string; ageMinutes: n
     `- something real`,
     ``,
   ].join("\n");
+  const createdAt = new Date(Date.now() - opts.ageMinutes * 60_000).toISOString();
   const fm = opts.legacy
     ? ""
-    : `---\nhandoff: pai-handoff-v1\nnode: ${opts.node ?? "l7440"}\nfrom_node: ${opts.node ?? "l7440"}\ncreated: 2026-08-20T05:23:36.863Z\nstate: ${opts.state ?? "open"}\naccepted_by: \naccepted_at: \naccepted_session: \n---\n`;
+    : `---\nhandoff: pai-handoff-v1\nnode: ${opts.node ?? "l7440"}\nfrom_node: ${opts.node ?? "l7440"}\ncreated: ${createdAt}\nstate: ${opts.state ?? "open"}\naccepted_by: \naccepted_at: \naccepted_session: \n---\n`;
   const p = join(work, name);
   writeFileSync(p, fm + body);
   const when = new Date(Date.now() - opts.ageMinutes * 60_000);
@@ -286,11 +287,12 @@ describe("--latest accept semantics", () => {
     run(["--latest"]); // accept rewrites the file — now the newest mtime in WORK
 
     const late = join(work, "session-handoff-20260821.md");
+    const lateCreated = new Date(Date.now() - 60_000).toISOString(); // newest created in WORK
     writeFileSync(late, [
       "---", "handoff: pai-handoff-v1", "node: l7440", "from_node: l7440",
-      "created: 2026-08-21T09:00:00.000Z", "state: open",
+      `created: ${lateCreated}`, "state: open",
       "accepted_by: ", "accepted_at: ", "accepted_session: ", "---",
-      "# Cargo manifest — 2026-08-21T09:00:00.000Z (l7440)", "",
+      `# Cargo manifest — ${lateCreated} (l7440)`, "",
       "## LANDED (complete, evidence in hand)", "", "- something real", "",
     ].join("\n"));
     const older = new Date(Date.now() - 120_000);
