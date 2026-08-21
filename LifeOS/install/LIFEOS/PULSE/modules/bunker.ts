@@ -45,6 +45,9 @@ let refreshInFlight = false;
 const REFRESH_TIMEOUT_MS = 4 * 60_000;
 
 async function refresh(): Promise<{ ok: boolean; reason?: string }> {
+  // No harness, no scan. Spawning `bun <missing file>` only produces a module-not-found
+  // on every poll and on every /refresh; absence is reported by health(), not by noise.
+  if (!bunkerAvailable()) return { ok: false, reason: "bunker harness not deployed on this install" };
   if (refreshInFlight) return { ok: false, reason: "refresh already in flight" };
   refreshInFlight = true;
   try {
@@ -73,6 +76,12 @@ export async function start(): Promise<void> {
   console.log(`[${MODULE}] Starting...`);
   state.running = true;
   state.startedAt = new Date();
+  // An absent harness is the normal state on an install that never deployed Bunker
+  // (see bunkerAvailable). Say it once, then stay inert: no initial scan, no poll.
+  if (!bunkerAvailable()) {
+    console.log(`[${MODULE}] Bunker harness not deployed on this install — /bunker tab inert`);
+    return;
+  }
   // Fire-and-forget: a full scan can take minutes and module start gates the
   // HTTP server coming up. The tab renders "first scan pending" until it lands.
   refresh().then((r) => {
