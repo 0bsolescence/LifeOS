@@ -409,12 +409,18 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
 
   if (req.method === "GET" && (sub === "/" || sub === "")) {
     if (!state.cache) {
+      // "Never deployed" and "first scan still running" both produce an empty
+      // snapshot; only the former will never resolve, so name it on the wire.
+      const missing = !bunkerAvailable();
       return Response.json({
         apps: [],
         summary: { apps: 0, green: 0, probesPass: 0, probesTotal: 0, manual: 0 },
         lastFetch: null,
         stale: true,
-        stale_reason: "no snapshot yet — first scan pending",
+        available: !missing,
+        stale_reason: missing
+          ? "Bunker harness not deployed on this install"
+          : "no snapshot yet — first scan pending",
       });
     }
     // Fold the cloud security grade into each app so every bay carries
