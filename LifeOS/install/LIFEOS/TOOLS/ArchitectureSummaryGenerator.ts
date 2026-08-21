@@ -159,7 +159,7 @@ const PIPELINE_ROUTER: Record<string, { what: string; doc: string }> = {
   "Config": { what: "settings.json, CLAUDE.md, system prompt; release tooling stages public artifacts", doc: "Config/ConfigSystem.md" },
   "Notifications": { what: "Voice notifications via Pulse to ElevenLabs, logged to VOICE events", doc: "Notifications/NotificationSystem.md" },
   "Doc Integrity": { what: "SessionEnd-hook cross-reference checks; regenerates this summary from the master doc", doc: "Hooks/HookSystem.md" },
-  "Bunker": { what: "Universal application harness — concept adopted, reference implementation private upstream and NOT deployed here, so the Pulse /bunker tab is inert; the Security plane (Arbol infra-security scanner, server-side, hourly) runs regardless", doc: "LifeosSystemArchitecture.md" },
+  "Bunker": { what: "Universal application harness — concept adopted, reference implementation private upstream and NOT deployed here, so the Pulse bunker module is inert; the Security plane (Arbol infra-security scanner, server-side, hourly) runs regardless", doc: "LifeosSystemArchitecture.md" },
   "Atlas": { what: "Graph-based asset management — the current state of everything owned; `atlas` CLI (owns/blast/unregistered), Pulse /atlas", doc: "Atlas/AtlasSystem.md" },
   "Ledger": { what: "Change-tracking authority — versioning, update registry, integrity gate, deploy events (the APPLIED half of the change pipeline)", doc: "Ledger/LedgerSystem.md" },
 };
