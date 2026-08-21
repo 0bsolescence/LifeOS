@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.1.2
+ * @version 1.2.0
  * MemoryTurnStart.hook.ts — the ONE UserPromptSubmit memory hook.
  *
  * Consolidation (2026-07-11, hooks BPE pass): merges the three per-prompt
@@ -32,7 +32,7 @@ import { run as loadMemory } from "./LoadMemory.hook";
 import { run as deltaSurface } from "./MemoryDeltaSurface.hook";
 import { getRelevantContext } from "../LIFEOS/TOOLS/MemoryRetriever";
 import { clearLedger as clearSystemDelta } from "./SystemChangeSurface.hook";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
@@ -78,6 +78,33 @@ function shouldInject(sessionId: string): boolean {
   return inject;
 }
 
+// ── A4 caller-side retrieval log (ruled 2026-08-21) ─────────────────────────
+// MemoryRetriever stays a pure reader; the caller that consumed the retrieval
+// owns the write. Row = MemoryStatus's documented summary fields plus the
+// `returned` identity array KnowledgeHarvester's seedling reinforcement counts.
+// Append-only, best-effort: a log failure must never block the prompt.
+const OBS_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY");
+const RETRIEVALS_LOG = pathResolve(OBS_DIR, "memory-retrievals.jsonl");
+
+function logRetrieval(
+  query: string,
+  results: { path: string; score: number }[],
+  durationMs: number,
+): void {
+  try {
+    const row = {
+      ts: new Date().toISOString(),
+      query_hash: createHash("sha256").update(query.trim().toLowerCase()).digest("hex").slice(0, 16),
+      top_score: results.length ? Number(results[0].score.toFixed(2)) : 0,
+      returned_count: results.length,
+      duration_ms: durationMs,
+      returned: results.map((r) => r.path),
+    };
+    mkdirSync(OBS_DIR, { recursive: true });
+    appendFileSync(RETRIEVALS_LOG, JSON.stringify(row) + "\n", "utf8");
+  } catch { /* best-effort — the retrieval already served its turn */ }
+}
+
 async function readStdin(): Promise<string> {
   return new Promise((resolve) => {
     let data = "";
@@ -118,7 +145,9 @@ if (isSubagent()) process.exit(0);
   // corpus, or trivial prompt) injects nothing.
   if (prompt.trim().length > 0) {
     try {
+      const t0 = Date.now();
       const ground = getRelevantContext(prompt, { topK: 5, threshold: 0.20 });
+      logRetrieval(prompt, ground.results, Date.now() - t0);
       if (ground.markdownBlock) {
         process.stdout.write(`<lifeos-ground>\n${ground.markdownBlock}\n</lifeos-ground>\n`);
       }
