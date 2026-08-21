@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-08-01T23:05:54.397Z
+last_updated: 2026-08-21T03:48:45.119Z
 last_updated_by: ArchitectureSummaryGenerator
 convention: pai-freshness-v1
 derived_from: LIFEOS/DOCUMENTATION/LifeosSystemArchitecture.md
@@ -31,7 +31,7 @@ One line per pipeline. Full wiring, file inventories, and incident notes: master
 | **Hooks** | Deterministic enforcement and context injection at Claude Code events | `LIFEOS/DOCUMENTATION/Hooks/HookSystem.md` |
 | **Observability** | Tool activity and failures appended to JSONL, read by Pulse | `LIFEOS/DOCUMENTATION/Observability/ObservabilitySystem.md` |
 | **Pulse** | The Life Dashboard server on :31337 — voice, work kanban, wiki, iMessage/Siri | `LIFEOS/DOCUMENTATION/Pulse/PulseSystem.md` |
-| **Bunker** | Universal application harness — canonical repo ~/.claude/LIFEOS/PULSE/Bunker; app state-of-record bunker.isa.md; Pulse /bunker tab; Security plane IS the Arbol infra-security scanner (server-side, hourly) | `LIFEOS/DOCUMENTATION/LifeosSystemArchitecture.md` |
+| **Bunker** | Universal application harness — concept adopted, reference implementation private upstream and NOT deployed here, so the Pulse bunker module is inert; the Security plane (Arbol infra-security scanner, server-side, hourly) runs regardless | `LIFEOS/DOCUMENTATION/LifeosSystemArchitecture.md` |
 | **Work System** | Four capture surfaces feeding private GitHub Issues as system of record | `LIFEOS/DOCUMENTATION/Work/WorkSystem.md` |
 | **Skills** | Domain capabilities: SKILL.md + workflows + deterministic tools | `LIFEOS/DOCUMENTATION/Skills/SkillSystem.md` |
 | **Config** | settings.json, CLAUDE.md, system prompt; release tooling stages public artifacts | `LIFEOS/DOCUMENTATION/Config/ConfigSystem.md` |
