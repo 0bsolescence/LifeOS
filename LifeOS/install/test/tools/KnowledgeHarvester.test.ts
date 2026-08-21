@@ -120,6 +120,29 @@ describe("access reinforcement", () => {
     expect(isStale(r.out, "repeated-in-one-row")).toBe(true);
   });
 
+  test("a path-logged retrieval reinforces only its own domain's note", () => {
+    // codex review 2026-08-21: two domains sharing a filename must not
+    // cross-reinforce when the log carries full paths.
+    const research = join(lifeos, "MEMORY", "KNOWLEDGE", "Research");
+    mkdirSync(research, { recursive: true });
+    seedling("shared-name");
+    const fm = [
+      `---`, `id: shared-name`, `type: research`, `title: shared-name`,
+      `quality: 1`, `created: ${daysAgo(WINDOW_DAYS + 30)}`, `---`, ``,
+      `Research body.`, ``,
+    ].join("\n");
+    writeFileSync(join(research, "shared-name.md"), fm);
+    const rows = Array.from({ length: THRESHOLD }, (_, i) =>
+      JSON.stringify({ ts: daysAgo(i + 1), returned: [join(ideas, "shared-name.md")] }),
+    );
+    writeFileSync(join(obs, "memory-retrievals.jsonl"), rows.join("\n") + "\n");
+
+    const r = status();
+
+    expect(isStale(r.out, "shared-name")).toBe(false); // Ideas/shared-name spared
+    expect(r.out.includes("Research/shared-name")).toBe(true); // Research twin still stale
+  });
+
   test("note identity is matched through paths, filenames and objects", () => {
     seedling("written-as-a-path");
     const rows = [

@@ -899,7 +899,9 @@ function getArchiveStats(): ArchiveStats {
       if (quality <= 2 && fm.created) {
         const created = new Date(fm.created);
         const daysSince = (Date.now() - created.getTime()) / (1000 * 60 * 60 * 24);
-        const reinforced = (retrievals.get(slug.toLowerCase()) ?? 0) >= RETRIEVAL_REINFORCEMENT_MIN;
+        const rCount = (retrievals.get(`${domain.toLowerCase()}/${slug.toLowerCase()}`) ?? 0)
+          + (retrievals.get(slug.toLowerCase()) ?? 0);
+        const reinforced = rCount >= RETRIEVAL_REINFORCEMENT_MIN;
         if (daysSince > SEEDLING_EXPIRY_DAYS && !reinforced) {
           stats.staleSeedlings.push(`${domain}/${slug}`);
         }
@@ -918,7 +920,13 @@ function getArchiveStats(): ArchiveStats {
   return stats;
 }
 
-/** Normalize any note reference — slug, filename, or path — to a bare lowercase slug. */
+/**
+ * Normalize any note reference — slug, filename, or path — to a lowercase key.
+ * A reference that carries a parent directory keeps it: `research/foo`, so two
+ * domains sharing a filename never reinforce each other (codex review,
+ * 2026-08-21). A bare reference degrades to the bare slug; consumers try the
+ * domain-qualified key first and fall back to bare only for such rows.
+ */
 function retrievalSlug(raw: unknown): string | null {
   let s: string | null = null;
   if (typeof raw === "string") s = raw;
@@ -929,8 +937,11 @@ function retrievalSlug(raw: unknown): string | null {
     }
   }
   if (!s) return null;
-  const base = s.split("/").pop()!.replace(/\.md$/i, "").trim().toLowerCase();
-  return base === "" ? null : base;
+  const parts = s.split("/").filter((p) => p.trim() !== "");
+  const base = (parts.pop() ?? "").replace(/\.md$/i, "").trim().toLowerCase();
+  if (base === "") return null;
+  const parent = parts.pop()?.trim().toLowerCase();
+  return parent ? `${parent}/${base}` : base;
 }
 
 /**
@@ -1009,7 +1020,13 @@ function expireStaleSeedlings(backlinks: Map<string, number>, retrievals: Map<st
 
       // Access reinforcement: a note the corpus keeps reaching for is in use,
       // whatever its quality score says.
-      if ((retrievals.get(slug) ?? 0) >= RETRIEVAL_REINFORCEMENT_MIN) continue;
+      // Domain-qualified counts are precise; bare-slug counts come from rows
+      // whose writer logged no path — ambiguous, but attributable here exactly
+      // as before the qualification fix. The sum keeps mixed-form rows for one
+      // note counting together while path-carrying rows never cross domains.
+      const retrievalCount = (retrievals.get(`${domain.toLowerCase()}/${slug}`) ?? 0)
+        + (retrievals.get(slug) ?? 0);
+      if (retrievalCount >= RETRIEVAL_REINFORCEMENT_MIN) continue;
 
       // Move to archive
       const archivePath = path.join(ARCHIVE_DIR, file);
