@@ -292,7 +292,10 @@ function eligibleOpen(all: Handoff[]): Handoff[] {
     const n = nodeOf(h);
     const barrier = n === null ? anyClaim : Math.max(claimedAt.get(n) ?? -Infinity, unattributedClaim);
     return orderMs(h) > barrier;
-  });
+  // The caller accepts [0] and expires the rest, so the ranking must ride the
+  // same immutable order as the barrier — an mtime scrambled by restore/sync/
+  // touch must not decide which handoff wins (codex review, 2026-08-21).
+  }).sort((a, b) => orderMs(b) - orderMs(a) || b.file.localeCompare(a.file));
 }
 
 /**
