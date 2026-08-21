@@ -83,7 +83,15 @@ function shouldInject(sessionId: string): boolean {
 // owns the write. Row = MemoryStatus's documented summary fields plus the
 // `returned` identity array KnowledgeHarvester's seedling reinforcement counts.
 // Append-only, best-effort: a log failure must never block the prompt.
-const OBS_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY");
+// Derive from LIFEOS_DIR exactly as KnowledgeHarvester does (normalizing the
+// unexpanded-$HOME shape, LifeOS#1404), so writer and reader always share one
+// observability dir on LIFEOS_DIR installs (codex review, 2026-08-21).
+const LIFEOS_DIR = (() => {
+  const v = process.env.LIFEOS_DIR;
+  if (!v) return pathResolve(CLAUDE_ROOT, "LIFEOS");
+  return /^\$\{?HOME\}?(\/|$)/.test(v) ? v.replace(/^\$\{?HOME\}?/, homedir()) : v;
+})();
+const OBS_DIR = pathResolve(LIFEOS_DIR, "MEMORY/OBSERVABILITY");
 const RETRIEVALS_LOG = pathResolve(OBS_DIR, "memory-retrievals.jsonl");
 
 function logRetrieval(
