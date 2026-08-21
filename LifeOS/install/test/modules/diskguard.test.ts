@@ -279,18 +279,20 @@ const DF_OK = {
 /** Let already-resolved promise chains drain before asserting. */
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
+// Discovery over a path that does not exist yields an empty watch list, which
+// is all these cases need — so they require no writable filesystem at all and
+// run identically in a sandbox with a read-only /tmp.
+const ABSENT_SNAP_ROOT = "/nonexistent/diskguard-test-snap-root";
+
 const stateRequest = () => new Request("http://127.0.0.1:31337/api/diskguard");
 const refreshRequest = () => new Request("http://127.0.0.1:31337/api/diskguard?refresh=1");
 
 describe("runtime lifecycle", () => {
-  let snapRoot: string;
-
   beforeEach(() => {
-    snapRoot = mkdtempSync(join(tmpdir(), "diskguard-runtime-"));
     __setRuntimeDepsForTests({
       runCmd: async () => DF_OK,
       loadSection: () => ({}),
-      snapRoot,
+      snapRoot: ABSENT_SNAP_ROOT,
       exists: () => false,
     });
   });
@@ -299,7 +301,6 @@ describe("runtime lifecycle", () => {
     await stop();
     await settle();
     __setRuntimeDepsForTests(null);
-    rmSync(snapRoot, { recursive: true, force: true });
   });
 
   test("start arms the periodic check and stop disarms it", async () => {
@@ -330,20 +331,18 @@ describe("runtime lifecycle", () => {
 });
 
 describe("concurrent check coalescing", () => {
-  let snapRoot: string;
   let dfCalls: number;
   let release: () => void;
   let gate: Promise<void>;
 
   beforeEach(() => {
-    snapRoot = mkdtempSync(join(tmpdir(), "diskguard-coalesce-"));
     dfCalls = 0;
     gate = new Promise<void>((r) => {
       release = r;
     });
     __setRuntimeDepsForTests({
       loadSection: () => ({}),
-      snapRoot,
+      snapRoot: ABSENT_SNAP_ROOT,
       exists: () => false,
       runCmd: async (cmd) => {
         if (cmd[0] === "df") dfCalls++;
@@ -358,7 +357,6 @@ describe("concurrent check coalescing", () => {
     await stop();
     await settle();
     __setRuntimeDepsForTests(null);
-    rmSync(snapRoot, { recursive: true, force: true });
   });
 
   test("two concurrent refreshes run one scan and share its report", async () => {
@@ -416,7 +414,7 @@ describe("concurrent check coalescing", () => {
   test("a failed scan releases the slot instead of pinning it forever", async () => {
     __setRuntimeDepsForTests({
       loadSection: () => ({}),
-      snapRoot,
+      snapRoot: ABSENT_SNAP_ROOT,
       exists: () => false,
       runCmd: async () => {
         throw new Error("df exploded");
