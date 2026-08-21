@@ -373,6 +373,11 @@ function flag(name: string): string | undefined {
   return i === -1 ? undefined : process.argv[i + 1];
 }
 
+/** Newest by the immutable lifecycle order — never by mtime (codex, 2026-08-21). */
+function newestByCreated(all: Handoff[]): Handoff {
+  return [...all].sort((a, b) => orderMs(b) - orderMs(a) || b.file.localeCompare(a.file))[0];
+}
+
 interface AcceptResult { path: string; notes: string[]; error?: string; contended?: boolean }
 
 function latest(): void {
@@ -380,7 +385,7 @@ function latest(): void {
     const all = listHandoffs();
     if (all.length === 0) { console.error("no handoff files"); process.exit(1); }
     const open = eligibleOpen(all);
-    const target = open[0] ?? all[0];
+    const target = open[0] ?? newestByCreated(all);
     console.error(
       open.length > 0
         ? `PEEK: no state changed (${open.length} open, ${all.length} total)`
@@ -412,8 +417,10 @@ function accept(): AcceptResult {
 
   if (open.length === 0) {
     // Every handoff has already been consumed. Still hand back the newest so a summons
-    // is never blanked, but say plainly that it is not a fresh record.
-    const newest = all[0];
+    // is never blanked, but say plainly that it is not a fresh record. "Newest" rides
+    // the same immutable order as the barriers — an accept's rewrite or a sync-
+    // scrambled mtime must not resurrect a stale manifest (codex, 2026-08-21).
+    const newest = newestByCreated(all);
     return {
       path: newest.path,
       notes: [`WARN: no open handoff; returning newest (state=${stateOf(newest)}, accepted_by=${newest.fm.accepted_by ?? "—"})`],
