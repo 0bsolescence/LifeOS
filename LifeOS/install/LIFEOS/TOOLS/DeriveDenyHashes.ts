@@ -28,7 +28,7 @@
  * token, so filtering here keeps the scan precise. Tune ALLOWLIST/STOPWORDS with
  * --show-tokens.
  */
-import { readFileSync, writeFileSync, existsSync, appendFileSync, readdirSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, readdirSync, mkdirSync, realpathSync, renameSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, sep } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -250,13 +250,55 @@ function main(): void {
   }
   // Write temp-then-rename ON THE RESOLVED DIR: rename replaces the directory
   // entry, so a statically crafted DENY_HASHES.json that is a symlink or hard
-  // link to a file elsewhere is replaced, never followed/truncated. Threat
-  // model boundary: an attacker mutating the tree concurrently mid-run already
-  // has code execution as this user and is out of scope.
+  // link to a file elsewhere is replaced, never followed/truncated.
+  //
+  // The TEMP file is the other half of that guarantee, and it used to be the
+  // weak half: `.tmp-<pid>` is predictable (PIDs are small and enumerable), so
+  // anyone able to write into this directory could PRE-PLANT a symlink at the
+  // temp path and capture the payload before the rename ever ran. Two changes
+  // close that: the suffix now carries 16 bytes of CSPRNG entropy, and the file
+  // is created O_EXCL|O_NOFOLLOW so an existing entry — symlink or regular file
+  // — makes the open REFUSE instead of following it. Mode 0600 keeps the
+  // intermediate unreadable. fsync before rename so the payload is durable on
+  // disk before it becomes the live file.
+  //
+  // Threat-model boundary, restated: this now covers a STATICALLY pre-created
+  // symlink at either the temp path or the final path. An attacker mutating the
+  // tree CONCURRENTLY mid-run already has code execution as this user and
+  // remains out of scope.
   const finalPath = join(outDir, "DENY_HASHES.json");
-  const tmpPath = join(outDir, `.DENY_HASHES.json.tmp-${process.pid}`);
-  writeFileSync(tmpPath, JSON.stringify(payload, null, 0) + "\n");
-  renameSync(tmpPath, finalPath);
+  const tmpPath = join(outDir, `.DENY_HASHES.json.tmp-${randomBytes(16).toString("hex")}`);
+  const body = Buffer.from(JSON.stringify(payload, null, 0) + "\n", "utf-8");
+  let fd: number;
+  try {
+    fd = openSync(tmpPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code ?? String(e);
+    console.error(`[DeriveDenyHashes] refusing write: could not create a fresh temp file at ${tmpPath} (${code})`);
+    process.exit(1);
+  }
+  let closed = false;
+  let renamed = false;
+  try {
+    // writeSync is permitted to short-write. Unlooped, a partial write would
+    // still be fsynced and renamed into place, installing a TRUNCATED deny
+    // list as the live one — a security control silently degraded rather than
+    // failing loudly. Loop until the whole buffer is down.
+    let off = 0;
+    while (off < body.length) {
+      const n = writeSync(fd, body, off, body.length - off);
+      if (n <= 0) throw new Error(`writeSync made no progress at offset ${off}/${body.length}`);
+      off += n;
+    }
+    fsyncSync(fd);
+    closeSync(fd); closed = true;
+    renameSync(tmpPath, finalPath); renamed = true;
+  } finally {
+    // Leave nothing behind on ANY failure path, including a throwing close or
+    // a failed rename: the temp carries the same payload as the real file.
+    if (!closed) { try { closeSync(fd); } catch { /* fd already unusable */ } }
+    if (!renamed) { try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ } }
+  }
   console.log(`[DeriveDenyHashes] wrote ${hashes.length} salted hashes -> ${finalPath} (no plaintext)`);
 }
 
