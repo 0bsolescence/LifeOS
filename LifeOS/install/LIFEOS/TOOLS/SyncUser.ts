@@ -45,6 +45,29 @@ function git(args: string[], cwd = CONFIG_DIR): { code: number; out: string; err
   return { code: p.exitCode ?? 1, out: p.stdout.toString().trim(), err: p.stderr.toString().trim() };
 }
 
+/**
+ * Strip credentials from a git remote URL before printing it.
+ *
+ * `git remote get-url` returns whatever is configured, and an HTTPS remote can
+ * carry credentials in the userinfo field — `https://user:token@host/...` or the
+ * equally common `https://<token>@host/...`. Doctor output gets pasted into
+ * issues, scrollback and logs, so printing it verbatim leaks the token.
+ *
+ * Rule: for any URL with a scheme, the whole userinfo field becomes `***`
+ * (both forms, since a bare userinfo is just as likely to BE the token). The
+ * scp-like ssh form `git@host:path` has no scheme, carries no secret, and is
+ * returned unchanged. Note `ssh://git@host/path` DOES have a scheme, so its
+ * username redacts too — deliberate: over-redacting a username is cheap,
+ * under-redacting a token is not.
+ */
+export function redactRemote(url: string): string {
+  // Greedy to the LAST `@` in the authority: per RFC 3986 userinfo runs to the
+  // final `@`, so a lazy first-`@` match left `https://user@<token>@host` still
+  // showing the token. `[^/?#]*` cannot cross into the path, so an `@` inside a
+  // path (https://host/o/weird@name.git) is untouched.
+  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)[^/?#]*@/, "$1***@");
+}
+
 function requireRepo(): void {
   if (!existsSync(join(CONFIG_DIR, ".git"))) {
     console.error(`❌ ${CONFIG_DIR} is not a git repo. Initialise it and add a PRIVATE remote first.`);
@@ -84,7 +107,7 @@ function cmdDoctor(): void {
   if (!bad) console.log(`✅ no machine-local tree captured (${MACHINE_LOCAL.join(", ")})`);
 
   const remote = git(["remote", "get-url", "origin"]);
-  console.log(remote.code === 0 ? `✅ remote: ${remote.out}` : "❌ no origin remote configured");
+  console.log(remote.code === 0 ? `✅ remote: ${redactRemote(remote.out)}` : "❌ no origin remote configured");
   if (remote.code !== 0) bad++;
 
   console.log(`\n${bad === 0 ? "sync layout healthy" : `${bad} problem(s)`}`);
