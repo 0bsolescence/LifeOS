@@ -8,7 +8,7 @@
  * state that must stay per-machine.
  *
  * SHARED (git, private remote)        MACHINE-LOCAL (never synced)
- *   USER/          identity, TELOS      MEMORY/WORK           per-machine sessions
+ *   USER/          identity, TELOS      MEMORY/WORK           shared (ruled 2026-08-29)
  *   MEMORY/KNOWLEDGE  curated notes     MEMORY/STATE          runtime state
  *   MEMORY/LEARNING   lessons           MEMORY/OBSERVABILITY  this host's telemetry
  *   SYNAPSE/*.toml    config            MEMORY/VOICE          local playback
@@ -37,8 +37,8 @@ const HOME = process.env.HOME || "";
 const CONFIG_DIR = process.env.LIFEOS_CONFIG_DIR || join(HOME, ".config", "LIFEOS");
 const HARNESS_MEMORY = join(HOME, ".claude", "LIFEOS", "MEMORY");
 
-const LINKED = ["KNOWLEDGE", "LEARNING"];
-const MACHINE_LOCAL = ["WORK", "STATE", "OBSERVABILITY", "VOICE", "SKILLS", "UPGRADES"];
+const LINKED = ["KNOWLEDGE", "LEARNING", "WORK"];
+const MACHINE_LOCAL = ["STATE", "OBSERVABILITY", "VOICE", "SKILLS", "UPGRADES"];
 
 function git(args: string[], cwd = CONFIG_DIR): { code: number; out: string; err: string } {
   const p = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
