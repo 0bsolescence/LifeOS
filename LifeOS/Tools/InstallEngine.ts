@@ -337,7 +337,7 @@ import { dirname } from "node:path";
 // Extended 2026-07-25 (Forge finding, v7.15.0 re-audit). The set stopped at .ts,
 // so every Pulse component and the built Next bundle were invisible to
 // substitution — a fresh install shipped a dashboard rendering
-// `desc="scored against TELOS — is this good for what {{PRINCIPAL_NAME}} is
+// `desc="scored against TELOS — is this good for what {{ PRINCIPAL_NAME }} is
 // actually doing?"` to the user, both in src and in the served
 // out/_next/static chunk. .css carries them too (Valkyrie voice notes).
 const TEMPLATE_EXTENSIONS = new Set([
@@ -472,10 +472,16 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
  * `{{TOKEN}}` forms (Art's thumbnail templating, Fabric pattern bodies, prose
  * about placeholders), so a blanket `{{[A-Z_]+}}` sweep is noise, not a signal.
  */
-const IDENTITY_PLACEHOLDERS = [
-  "{{DA_NAME}}", "{{DA_FULL_NAME}}", "{{PRINCIPAL_NAME}}", "{{PRINCIPAL_FULL_NAME}}",
-  "{{PRIMARY_VOICE_ID}}", "{{SECONDARY_VOICE_ID}}", "{{LIFEOS_VERSION}}",
+// Assembled from bare keys, never written as literal `{{KEY}}` tokens: this
+// file lives under skills/LifeOS/Tools in the installed tree, so substituteTree
+// walks it too. Written literally, the list itself was substituted and the
+// checker went hunting for the owner's real name across the whole tree — 275
+// false survivors on a clean install (2026-09-01).
+const IDENTITY_PLACEHOLDER_KEYS = [
+  "DA_NAME", "DA_FULL_NAME", "PRINCIPAL_NAME", "PRINCIPAL_FULL_NAME",
+  "PRIMARY_VOICE_ID", "SECONDARY_VOICE_ID", "LIFEOS_VERSION",
 ] as const;
+const IDENTITY_PLACEHOLDERS = IDENTITY_PLACEHOLDER_KEYS.map((k) => "{{" + k + "}}");
 
 /**
  * Post-substitution verification: report any identity placeholder still present
@@ -484,7 +490,7 @@ const IDENTITY_PLACEHOLDERS = [
  * Why this exists (Forge finding D, 2026-07-25 v7.15.0 audit): `substituteTree`
  * has no code caller. The install is AI-driven by design — `Workflows/Setup.md`
  * step 34 instructs the agent to call it — so a skipped or mis-rooted step ships
- * a system that addresses its owner as `{{PRINCIPAL_NAME}}` with nothing failing.
+ * a system that addresses its owner as `{{ PRINCIPAL_NAME }}` with nothing failing.
  * The old engine's `runSurvivingPlaceholdersCheck` covered this and was lost when
  * `engine/actions.ts` was retired; this restores it against the current engine.
  * Verification, not mutation: the caller decides whether to re-run substitution
