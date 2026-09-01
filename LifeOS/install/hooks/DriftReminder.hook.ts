@@ -39,6 +39,7 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { firstBannedHit } from "./lib/banned-vocab";
+import { getIdentity } from "./lib/identity";
 import { homedir } from "node:os";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
@@ -82,6 +83,16 @@ const INITIAL_STATE: DriftState = {
 // One format since 2026-07-11 (modes retired): the single LifeOS banner.
 // The ═══ substring matches the unified `════ LifeOS ═══…` header.
 const MODE_BANNERS = ["═══ LifeOS ═══"] as const;
+/** The closer glyph comes from identity, the way FormatGate resolves it — a
+ *  hardcoded 🗣️ flagged "no closer" on every clean turn once the identity
+ *  icon changed, contaminating the contract line and any drift measurement. */
+const CLOSER_GLYPH = (() => {
+  const DEFAULT_GLYPH = "\u{1F5E3}\uFE0F";
+  try { return getIdentity().icon || DEFAULT_GLYPH; } catch { return DEFAULT_GLYPH; }
+})();
+const CLOSER_RE = new RegExp(
+  [CLOSER_GLYPH, "\u{1F5E3}\uFE0F"].map((g) => g.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+);
 
 async function readStdinWithTimeout(timeoutMs: number = STDIN_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -179,7 +190,7 @@ function measure(text: string): FormatMeasure {
     lines: prose.split("\n").filter((l) => l.trim().length > 0).length,
     emDashes: countEmDashes(prose),
     banner: MODE_BANNERS.some((banner) => text.includes(banner)),
-    closer: /🗣️/.test(text),
+    closer: CLOSER_RE.test(text),
     banned: firstBannedHit(text),
   };
 }
@@ -207,7 +218,7 @@ function contractLine(cap: number | null, last: FormatMeasure | null): string {
   const budget = cap === null
     ? "depth requested, line cap lifted"
     : `max ${cap} prose lines`;
-  const structure = "banner first, 🗣️ closer last, max 2 em-dashes";
+  const structure = `banner first, ${CLOSER_GLYPH} closer last, max 2 em-dashes`;
   const previous = last
     ? (() => {
         const broke = breaksIn(last, cap);

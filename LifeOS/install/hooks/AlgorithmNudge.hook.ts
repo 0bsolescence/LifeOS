@@ -62,7 +62,7 @@
  * (`bun AlgorithmNudge.hook.ts --rebuild-index`) and this turn proceeds without it.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'fs';
 import { join } from 'path';
 import { resolveBun } from './lib/resolve-bin';
 import { deriveAscent, type AscentState } from '../LIFEOS/TOOLS/ascent';
@@ -312,9 +312,37 @@ function cooled(state: NudgeState, type: string, now: number, ms: number = COOLD
   return now - (state.lastNudgeAt[type] || 0) >= ms;
 }
 
+/** Session the current invocation is serving; set once per run so fire() can
+ *  log without threading the id through every call site. */
+let currentSession = '';
+
 function fire(state: NudgeState, type: string, now: number, text: string, out: string[]): void {
   state.lastNudgeAt[type] = now;
   out.push(text);
+  logNudgeFire(currentSession, type);
+}
+
+/** One row per tool-call nudge fire, same file and cap as the routing fires,
+ *  so a fire-rate read-out covers every nudge type — before this the six
+ *  tool-call rows (delegation, stale/late ISA, destructive infra) left no
+ *  trace outside the per-session state file. Rotates the file at the cap
+ *  instead of going silent: the newest window is the one a read-out needs. */
+function logNudgeFire(sessionId: string, type: string): void {
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), session: sessionId.slice(0, 8), nudge: type });
+    const path = join(PAI, 'LIFEOS', 'MEMORY', 'OBSERVABILITY', 'algo-nudge-routing.jsonl');
+    rotateIfOverCap(path);
+    writeFileSync(path, line + '\n', { flag: 'a' });
+  } catch {}
+}
+
+/** Keep the log bounded without dropping the newest data: past the cap, the
+ *  current file becomes `<name>.1` (one prior generation kept) and appends
+ *  continue in a fresh file. */
+function rotateIfOverCap(path: string): void {
+  try {
+    if (existsSync(path) && statSync(path).size > ROUTING_LOG_CAP_BYTES) renameSync(path, `${path}.1`);
+  } catch {}
 }
 
 // ── Skill-routing index ──────────────────────────────────────────────────────
@@ -412,10 +440,9 @@ function logRoutingFire(sessionId: string, prompt: string, matches: Array<{ skil
       fired: matches.map(m => `${m.skill}:${m.phrase}`),
     });
     const path = join(PAI, 'LIFEOS', 'MEMORY', 'OBSERVABILITY', 'algo-nudge-routing.jsonl');
-    // Bounded append (Forge audit 2026-07-11): tuning telemetry, not a system of
-    // record — stop growing past the cap rather than accumulate prompt fragments
-    // unbounded. Newest lines are lost when full; that's fine for floor-tuning.
-    try { if (existsSync(path) && statSync(path).size > ROUTING_LOG_CAP_BYTES) return; } catch {}
+    // Bounded by rotation, not by going silent: tuning telemetry stays capped
+    // and the newest window is always the one on disk.
+    rotateIfOverCap(path);
     writeFileSync(path, line + '\n', { flag: 'a' });
   } catch {}
 }
@@ -662,6 +689,7 @@ export function run(input: HookInput): string | null {
     if (!sessionId || !SESSION_ID_RE.test(sessionId)) return null;
 
     const now = Date.now();
+    currentSession = sessionId;
     const state = loadState(sessionId);
     const active = activeAlgorithmSession(sessionId);
     const out: string[] = [];
