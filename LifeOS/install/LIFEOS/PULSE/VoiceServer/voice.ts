@@ -107,11 +107,13 @@ let initialized = false
 // Per-provider synthesis budget scales with the text. Measured 2026-09-01 on a
 // 12-core i7-1365U running Kokoro on CPU: 11 chars → 2.6s, 301 chars → 24.4s
 // (~80 ms/char plus ~2s floor). A fixed 10s budget would have failed every
-// closer over ~100 chars. 100 ms/char + 5s, capped at 50s so the 500-char
-// message cap fits and the VoiceNotification hook (55s) still outlasts one
-// link. `timeout_ms` on the provider overrides the formula outright.
+// closer over ~100 chars. 100 ms/char + a 10s floor (the pre-chain default,
+// so short lines on a slow remote provider keep the latency headroom they
+// had), capped at 50s so the 500-char message cap fits and the
+// VoiceNotification hook (55s) still outlasts one link. `timeout_ms` on the
+// provider overrides the formula outright.
 const SYNTH_MS_PER_CHAR = 100
-const SYNTH_FLOOR_MS = 5_000
+const SYNTH_FLOOR_MS = 10_000
 const SYNTH_CAP_MS = 50_000
 
 function synthBudgetMs(provider: VoiceProvider, text: string): number {
