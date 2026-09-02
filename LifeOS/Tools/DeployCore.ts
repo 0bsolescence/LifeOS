@@ -7,12 +7,23 @@
  * Without it a fresh install has exactly one skill, no runtime, and the active
  * `@LIFEOS/DOCUMENTATION/ARCHITECTURE_SUMMARY.md` import in CLAUDE.md dangles.
  *
- * Every copy goes through InstallEngine.copyMissing — recursive, existsSync-
- * guarded, NEVER overwrites a populated target. So it is idempotent: a second
- * `--apply` copies 0. Dry-run by default (`--apply` to mutate); REFUSES the
- * author's live source tree (`--allow-dev` to override; exit 2). A required
+ * Every install copy goes through InstallEngine.copyMissing — recursive,
+ * existsSync-guarded, NEVER overwrites a populated target. So it is idempotent:
+ * a second `--apply` copies 0. Dry-run by default (`--apply` to mutate); REFUSES
+ * the author's live source tree (`--allow-dev` to override; exit 2). A required
  * payload source dir that is ABSENT is a LOUD blocker that fails the run
  * (exit 1) — never a silent ok (matches DeployComponents' failure contract).
+ *
+ * `--update` is the other half: bring an already-populated tree current with
+ * the payload. Same trees (skills, runtime, hook files, dependency manifests),
+ * same skips (USER, MEMORY, node_modules, .git), through InstallEngine.copyChanged
+ * — sha256 compare after rendering the identity placeholders the install
+ * substituted, overwrite on difference with the prior content preserved aside,
+ * skip any destination that is a symlink (an overlay or shared dir belongs to
+ * its own lane), report orphans and never delete them. Install mode never
+ * overwrites; update mode never runs on an undeployed tree. Both are dry-run
+ * by default and both assert the postcondition by count (update: every write
+ * read back at the intended hash), never by exit code.
  *
  * Targets the config-root runtime at the ALL-CAPS `<configRoot>/LIFEOS/` so it
  * matches the `@LIFEOS/...` imports in CLAUDE.md (NOT mixed-case `LifeOS`).
@@ -20,12 +31,15 @@
  * Usage:
  *   bun DeployCore.ts [--config-root <dir>] [--skill-root <dir>] [--apply] [--allow-dev]
  *   (dry-run by default — reports the plan per target without writing)
+ *   bun DeployCore.ts --update [--apply] [--backup-dir <dir> | --no-backup] [--no-render]
+ *   (dry-run by default — hashes every payload file against the deployed tree and
+ *    reports added/updated/unchanged/skippedSymlink/orphans exactly, writing nothing)
  */
 
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { copyMissing, detectDevTree } from "./InstallEngine";
+import { copyChanged, copyMissing, detectDevTree, readIdentityVars, type CopyChangedResult, type TemplateVars } from "./InstallEngine";
 
 // Runtime top-level entries this tool does NOT deploy:
 //  - USER           shipped separately as a scaffold (ScaffoldUser) + symlinked (LinkUser)
@@ -49,7 +63,7 @@ interface SkillConflict {
 }
 
 interface DeployResult {
-  what: "skills" | "runtime" | "memory" | "dependencies" | "nested-dependencies";
+  what: "skills" | "runtime" | "hooks" | "memory" | "dependencies" | "nested-dependencies";
   src: string;
   dst: string;
   present: boolean;
@@ -325,6 +339,273 @@ function deployNestedDependencies(payloadInstall: string, configRoot: string, ap
   return r;
 }
 
+// ── Update mode (--update) ────────────────────────────────────────────────────
+//
+// Install mode above is additive by contract and stays untouched. Update mode
+// is the other half: bring a POPULATED deployed tree current with the payload
+// it came from. Same three trees the install lays down, same skips, one new
+// rule — a destination that is a symlink belongs to whoever linked it and is
+// never written through or replaced (InstallEngine.copyChanged states the full
+// rule set). Dry-run by default; `--apply` writes; the postcondition is the
+// read-back hash count, and `ok` requires verified === added + updated.
+
+// Payload files the NODE owns once installed. Update mode hashes and reports
+// them (so upstream movement is visible) but never writes them:
+//  - PULSE/PULSE.toml            seeded config, edited in place (voice engine, modules)
+//  - DOCUMENTATION/ARCHITECTURE_SUMMARY.md   regenerated on the node by a SessionEnd hook
+//  - bun.lock (any dir)          rewritten by the node's own `bun install`
+// Paths are configRoot-relative; names match at any depth.
+const UPDATE_PROTECTED_PATHS = new Set([
+  "LIFEOS/PULSE/PULSE.toml",
+  "LIFEOS/DOCUMENTATION/ARCHITECTURE_SUMMARY.md",
+]);
+const UPDATE_PROTECTED_NAMES = new Set(["bun.lock"]);
+function protectedUnder(prefix: string): (rel: string) => boolean {
+  return (rel) => UPDATE_PROTECTED_PATHS.has(`${prefix}/${rel}`) || UPDATE_PROTECTED_NAMES.has(basename(rel));
+}
+
+interface UpdateContext {
+  apply: boolean;
+  vars?: TemplateVars;
+  backupDir?: string;
+}
+
+interface UpdateResult extends DeployResult {
+  added: string[];
+  updated: Array<{ path: string; before: string; after: string }>;
+  unchanged: number;
+  skippedSymlink: string[];
+  orphans: string[];
+  skippedProtected: Array<{ path: string; differs: boolean }>;
+  verified: number;
+}
+
+function emptyUpdate(what: DeployResult["what"], src: string, dst: string): UpdateResult {
+  return { what, src, dst, present: existsSync(src), copied: 0, actions: [], blockers: [], failures: [], added: [], updated: [], unchanged: 0, skippedSymlink: [], orphans: [], skippedProtected: [], verified: 0 };
+}
+
+function fold(r: UpdateResult, c: CopyChangedResult): void {
+  r.added.push(...c.added);
+  r.updated.push(...c.updated);
+  r.unchanged += c.unchanged;
+  r.skippedSymlink.push(...c.skippedSymlink);
+  r.orphans.push(...c.orphans);
+  r.skippedProtected.push(...c.skippedProtected);
+  r.verified += c.verified;
+  r.failures.push(...c.failures);
+  r.copied += c.added.length + c.updated.length;
+}
+
+/** (a') skills: per payload skill dir, same case-insensitive collision rule as install. */
+function updateSkills(payloadInstall: string, configRoot: string, ctx: UpdateContext): UpdateResult {
+  const src = join(payloadInstall, "skills");
+  const dst = join(configRoot, "skills");
+  const r = emptyUpdate("skills", src, dst);
+  r.conflicts = [];
+  if (!r.present) {
+    r.blockers.push(`skills payload missing: ${src} — point --skill-root at the payload tree`);
+    return r;
+  }
+  const existingByLower = new Map<string, string>();
+  if (existsSync(dst)) {
+    for (const e of readdirSync(dst)) existingByLower.set(e.toLowerCase(), e);
+  }
+  for (const entry of readdirSync(src, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const name = entry.name;
+    const match = existingByLower.get(name.toLowerCase());
+    if (match !== undefined && match !== name) {
+      r.conflicts.push({
+        payload: name,
+        existing: match,
+        detail: `pre-existing '${match}' collides case-insensitively with payload '${name}' — skill NOT updated, existing dir untouched. Resolve by renaming/moving '${join(dst, match)}', then re-run.`,
+      });
+      continue;
+    }
+    r.actions.push(`copyChanged ${join(src, name)} → ${join(dst, name)}`);
+    fold(r, copyChanged(join(src, name), join(dst, name), { vars: ctx.vars, backupDir: ctx.backupDir && join(ctx.backupDir, "skills", name), dryRun: !ctx.apply, protect: protectedUnder(`skills/${name}`) }));
+  }
+  return r;
+}
+
+/** (b') runtime: install/LIFEOS/<entry> → configRoot/LIFEOS/<entry>, RUNTIME_SKIP excluded, symlinks skipped. */
+function updateRuntime(payloadInstall: string, configRoot: string, ctx: UpdateContext): UpdateResult {
+  const src = existsSync(join(payloadInstall, "LIFEOS")) ? join(payloadInstall, "LIFEOS") : join(payloadInstall, "LifeOS");
+  const dst = join(configRoot, "LIFEOS");
+  const r = emptyUpdate("runtime", src, dst);
+  if (!r.present) {
+    r.blockers.push(`runtime payload missing: ${src} — point --skill-root at the payload tree`);
+    return r;
+  }
+  if (!existsSync(dst)) {
+    r.blockers.push(`${dst} is not deployed — update mode brings a populated tree current; run the install (--apply without --update) first`);
+    return r;
+  }
+  const entries = readdirSync(src, { withFileTypes: true })
+    .filter((e) => !RUNTIME_SKIP.has(e.name))
+    .map((e) => e.name)
+    .sort();
+  for (const name of entries) {
+    r.actions.push(`copyChanged ${join(src, name)} → ${join(dst, name)}`);
+    fold(r, copyChanged(join(src, name), join(dst, name), { vars: ctx.vars, backupDir: ctx.backupDir && join(ctx.backupDir, "LIFEOS", name), dryRun: !ctx.apply, protect: protectedUnder(`LIFEOS/${name}`) }));
+  }
+  return r;
+}
+
+/**
+ * (f') hook FILES: install/hooks → configRoot/hooks. The install copies these
+ * with force:false (InstallHooks, Setup step 7) and the wiring in settings.json
+ * is that tool's job — this leg only keeps the bodies current. A hook the
+ * owner declined never gets wired by an update; a hook that was wired gets its
+ * current body. Wiring drift is reported by InstallHooks' own dry-run.
+ */
+function updateHooks(payloadInstall: string, configRoot: string, ctx: UpdateContext): UpdateResult {
+  const src = join(payloadInstall, "hooks");
+  const dst = join(configRoot, "hooks");
+  const r = emptyUpdate("hooks", src, dst);
+  if (!r.present) {
+    r.blockers.push(`hooks payload missing: ${src} — point --skill-root at the payload tree`);
+    return r;
+  }
+  if (!existsSync(dst)) {
+    r.actions.push(`${dst} absent — hooks were never installed on this tree (declined or pre-step-7); nothing to update`);
+    return r;
+  }
+  r.actions.push(`copyChanged ${src} → ${dst}`);
+  fold(r, copyChanged(src, dst, { vars: ctx.vars, backupDir: ctx.backupDir && join(ctx.backupDir, "hooks"), dryRun: !ctx.apply, protect: protectedUnder("hooks") }));
+  return r;
+}
+
+/**
+ * (d') shared runtime deps in update mode: the manifest is brought current with
+ * copyChanged, and `bun install` runs only when it changed or node_modules is
+ * absent — a no-change run spawns nothing.
+ */
+function updateDependencies(payloadInstall: string, configRoot: string, ctx: UpdateContext): UpdateResult {
+  const src = join(payloadInstall, "package.json");
+  const dst = join(configRoot, "package.json");
+  const r = emptyUpdate("dependencies", src, dst);
+  if (!r.present) {
+    r.blockers.push(`dependency manifest missing: ${src} — point --skill-root at the payload tree`);
+    return r;
+  }
+  fold(r, copyChanged(src, dst, { backupDir: ctx.backupDir && join(ctx.backupDir, "package.json.d"), dryRun: !ctx.apply }));
+  const needsInstall = r.added.length + r.updated.length > 0 || !existsSync(join(configRoot, "node_modules"));
+  if (!needsInstall) return r;
+  if (!ctx.apply) { r.actions.push(`bun install --cwd ${configRoot}`); return r; }
+  if (r.failures.length > 0) return r;
+  const proc = Bun.spawnSync(["bun", "install"], { cwd: configRoot, stdout: "pipe", stderr: "pipe" });
+  if (proc.exitCode !== 0) r.failures.push(`bun install --cwd ${configRoot} exited ${proc.exitCode}: ${proc.stderr.toString().trim()}`);
+  else r.actions.push(`bun install --cwd ${configRoot}`);
+  return r;
+}
+
+/** (e') nested deps in update mode: only dirs whose package.json moved, or that have no node_modules yet. */
+function updateNestedDependencies(payloadInstall: string, configRoot: string, ctx: UpdateContext, changedPaths: Set<string>): UpdateResult {
+  const runtimeDst = join(configRoot, "LIFEOS");
+  const skillsDst = join(configRoot, "skills");
+  const r = emptyUpdate("nested-dependencies", runtimeDst, runtimeDst);
+  if (!r.present) return r;
+  const payloadSkills = join(payloadInstall, "skills");
+  const nestedPayload = join(skillsDst, basename(dirname(payloadInstall)), "install");
+  const ownSkillDirs = existsSync(payloadSkills)
+    ? readdirSync(payloadSkills, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => join(skillsDst, e.name))
+        .filter(existsSync)
+    : [];
+  const dirs = [
+    ...findNestedDependencyDirs(runtimeDst),
+    ...ownSkillDirs.flatMap((d) => findNestedDependencyDirs(d, new Set([nestedPayload]))),
+  ].filter((dir) => changedPaths.has(join(dir, "package.json")) || !existsSync(join(dir, "node_modules")));
+  for (const dir of dirs) {
+    if (!ctx.apply) { r.actions.push(`bun install --cwd ${dir}`); continue; }
+    const proc = Bun.spawnSync(["bun", "install"], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) { r.failures.push(`bun install --cwd ${dir} exited ${proc.exitCode}: ${proc.stderr.toString().trim()}`); continue; }
+    r.copied++;
+    r.actions.push(`bun install --cwd ${dir}`);
+  }
+  return r;
+}
+
+function runUpdate(payloadInstall: string, configRoot: string, a: string[], apply: boolean): void {
+  const versionFile = join(payloadInstall, "LIFEOS", "VERSION");
+  const version = existsSync(versionFile) ? readFileSync(versionFile, "utf-8").trim() : "";
+  const noRender = a.includes("--no-render");
+  const identity = noRender ? undefined : readIdentityVars(configRoot, version);
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const backupDir = a.includes("--no-backup")
+    ? undefined
+    : arg(a, "--backup-dir") || join(configRoot, "LIFEOS", "MEMORY", "STATE", "deploy-updates", stamp);
+  const ctx: UpdateContext = { apply, vars: identity?.vars, backupDir };
+
+  // Rendering is what keeps an update idempotent against a substituted tree.
+  // Missing identity is a blocker, not a fallback: writing raw tokens over a
+  // rendered tree would un-name the owner's system and call it an update.
+  const blockersEarly: string[] = [];
+  if (identity && identity.missing.length > 0) {
+    blockersEarly.push(`identity vars unavailable (${identity.missing.join(", ")}) from ${identity.source} — refusing to render; pass --no-render only for a tree that was never substituted`);
+  }
+
+  const results: UpdateResult[] = [];
+  if (blockersEarly.length === 0) {
+    results.push(updateSkills(payloadInstall, configRoot, ctx));
+    results.push(updateRuntime(payloadInstall, configRoot, ctx));
+    results.push(updateHooks(payloadInstall, configRoot, ctx));
+    results.push(updateDependencies(payloadInstall, configRoot, ctx));
+    const changedPaths = new Set<string>(results.flatMap((r) => [...r.added, ...r.updated.map((u) => u.path)]));
+    results.push(updateNestedDependencies(payloadInstall, configRoot, ctx, changedPaths));
+  }
+  const memory = scaffoldMemory(configRoot, apply);
+
+  const blockers = [...blockersEarly, ...results.flatMap((r) => r.blockers), ...memory.blockers];
+  const failures = [...results.flatMap((r) => r.failures), ...memory.failures];
+  const added = results.reduce((n, r) => n + r.added.length, 0);
+  const updated = results.reduce((n, r) => n + r.updated.length, 0);
+  const unchanged = results.reduce((n, r) => n + r.unchanged, 0);
+  const skippedSymlink = results.reduce((n, r) => n + r.skippedSymlink.length, 0);
+  const orphans = results.reduce((n, r) => n + r.orphans.length, 0);
+  const protectedAll = results.flatMap((r) => r.skippedProtected);
+  const protectedDrift = protectedAll.filter((p) => p.differs).map((p) => p.path);
+  const verified = results.reduce((n, r) => n + r.verified, 0);
+  const skillConflicts = results.find((r) => r.what === "skills")?.conflicts ?? [];
+  // The postcondition: every write read back at the intended hash. Not the exit code.
+  const postconditionMet = !apply || verified === added + updated;
+  if (apply && !postconditionMet) failures.push(`postcondition: verified ${verified} != added ${added} + updated ${updated}`);
+  const ok = blockers.length === 0 && failures.length === 0;
+
+  const notes: string[] = [];
+  if (skillConflicts.length > 0) notes.push(`⚠️ ${skillConflicts.length} skill(s) NOT updated — case-insensitive name collision (see skillConflicts).`);
+  if (!apply) notes.push("dry-run — re-run with --update --apply to write (counts above are exact: every file was hashed)");
+  if (apply && backupDir && updated > 0) notes.push(`prior content of ${updated} overwritten file(s) preserved under ${backupDir}`);
+  if (protectedDrift.length > 0) notes.push(`${protectedDrift.length} node-owned file(s) differ from the payload and were NOT written (see protectedDrift) — merge by hand if the upstream change matters`);
+
+  console.log(JSON.stringify({
+    ok,
+    mode: "update",
+    dryRun: !apply,
+    configRoot,
+    payloadInstall,
+    payloadVersion: version || undefined,
+    identitySource: identity?.source,
+    rendered: !noRender,
+    backupDir: apply && updated > 0 ? backupDir : undefined,
+    summary: { added, updated, unchanged, skippedSymlink, orphans, protected: protectedAll.length, protectedDrift: protectedDrift.length, verified },
+    protectedDrift,
+    skillConflicts,
+    blockers,
+    failures,
+    results: results.map((r) => ({
+      what: r.what, src: r.src, dst: r.dst, present: r.present,
+      added: r.added, updated: r.updated, unchanged: r.unchanged,
+      skippedSymlink: r.skippedSymlink, orphans: r.orphans, skippedProtected: r.skippedProtected, verified: r.verified,
+      actions: r.actions, blockers: r.blockers, failures: r.failures,
+    })),
+    memory,
+    note: notes.length > 0 ? notes.join(" | ") : undefined,
+  }, null, 2));
+  process.exit(ok ? 0 : 1);
+}
+
 function main(): void {
   const a = process.argv.slice(2);
   const home = process.env.HOME || homedir();
@@ -333,6 +614,7 @@ function main(): void {
   const payloadInstall = join(skillRoot, "install");
   const apply = a.includes("--apply");
   const allowDev = a.includes("--allow-dev");
+  const update = a.includes("--update");
 
   if (detectDevTree(configRoot) && !allowDev) {
     console.log(JSON.stringify({
@@ -341,6 +623,11 @@ function main(): void {
       detail: `${configRoot} is a LifeOS source tree (dev-tree marker present) — refusing to deploy core. Use --allow-dev only in a sandbox.`,
     }, null, 2));
     process.exit(2);
+  }
+
+  if (update) {
+    runUpdate(payloadInstall, configRoot, a, apply);
+    return;
   }
 
   const results = [

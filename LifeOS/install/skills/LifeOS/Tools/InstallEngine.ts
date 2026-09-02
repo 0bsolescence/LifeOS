@@ -13,6 +13,7 @@
  */
 
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -403,6 +404,237 @@ export function copyMissing(src: string, dst: string): { copied: number; failure
   };
   walk(src, dst);
   return { copied, failures };
+}
+
+// ── Update mode: copyChanged ──
+//
+// copyMissing above is deliberately additive: it is the INSTALL primitive and
+// must never clobber what a prior install (or the owner) put in place. That
+// same guarantee is what makes it useless for keeping a deployed tree current:
+// a payload file that CHANGED between releases never reaches a populated
+// target — "a second --apply copies 0" is true whether or not the payload
+// moved. Measured on one estate (2026-08-30): an in-place 7.28.3→7.40.4 would
+// add 160 files, silently skip 499 modified ones, and exit 0.
+//
+// copyChanged is the UPDATE primitive. Rules, in order, per payload entry:
+//   1. SKIP_DIRS (node_modules, .git, MEMORY) are never entered.
+//   2. A destination that is a SYMLINK — file or directory — is skipped whole.
+//      A link in the deployed tree is owned by whoever placed it (a per-file
+//      overlay into the owner's private tools, a shared MEMORY dir, the USER
+//      zone) and is kept current by that owner's own lane; the payload never
+//      writes through it and never replaces it.
+//   3. Payload content is RENDERED first (identity placeholders substituted,
+//      template extensions only — the same tokens and file set as
+//      substituteTree) so a tree that was substituted at install compares
+//      equal to the payload it came from. Without this every one of the ~117
+//      placeholder-bearing files would read as changed on every run, and the
+//      overwrite would re-introduce the raw tokens.
+//   4. Missing → added. Byte-identical (sha256) → unchanged, no write.
+//      Different → the prior content is preserved under `backupDir` at its
+//      dst-relative path (archive-then-burn), then the rendered payload is
+//      written atomically (tmp + rename, payload mode preserved).
+//   5. Every write is read back and re-hashed; `verified` counts the files
+//      whose on-disk hash equals the intended one. A caller asserts
+//      verified === added + updated, never the exit code.
+//   6. Files present in dst but absent from the payload are reported as
+//      `orphans` and NEVER removed — the deployed tree legitimately carries
+//      generated files, lockfiles, archived copies and owner additions.
+//   7. A path the caller marks PROTECTED (`opts.protect`) is hashed and
+//      reported — with whether it differs — but never written. This is for
+//      payload files the node owns after install: config seeded once and then
+//      edited in place, and derived files the node regenerates itself.
+//
+// Nothing in the payload is ever treated as owner-owned by name: a name the
+// payload ships is fork-owned, and a local edit to it is drift this primitive
+// corrects (and preserves aside). Owner content belongs in USER, MEMORY, or a
+// symlinked overlay — the three places this never writes.
+
+export interface CopyChangedOptions {
+  /** Identity vars rendered into template-extension payload files before compare and write. */
+  vars?: TemplateVars;
+  /** Receives the prior content of every overwritten file at its dst-relative path, before the write. */
+  backupDir?: string;
+  /** Report only: hashes and classifies every file, writes nothing (no backup either). */
+  dryRun?: boolean;
+  /** dst-relative path (from the copyChanged root) → true to report-but-never-write. */
+  protect?: (rel: string) => boolean;
+}
+
+export interface CopyChangedResult {
+  /** dst paths created (absent before). */
+  added: string[];
+  /** dst paths overwritten, with sha256 before and after. */
+  updated: Array<{ path: string; before: string; after: string }>;
+  unchanged: number;
+  /** dst entries skipped because they are symlinks (overlay-/owner-owned). */
+  skippedSymlink: string[];
+  /** dst entries skipped by name (SKIP_DIRS). */
+  skippedDir: string[];
+  /** dst files (or dirs, trailing "/") with no payload counterpart — reported, never removed. */
+  orphans: string[];
+  /** Protected paths encountered; `differs` says whether the payload has moved away from the node's copy. */
+  skippedProtected: Array<{ path: string; differs: boolean }>;
+  /** Writes whose read-back hash equals the intended hash (0 on dry run). */
+  verified: number;
+  failures: string[];
+}
+
+function sha256(buf: Buffer): string {
+  return createHash("sha256").update(buf).digest("hex");
+}
+
+/**
+ * Render a payload file exactly as substituteTree would after the copy: only
+ * properly delimited identity tokens, only in template-extension files. Binary
+ * and non-template files pass through byte-for-byte.
+ */
+function renderPayloadFile(srcPath: string, vars: TemplateVars | undefined): Buffer {
+  const raw = readFileSync(srcPath);
+  if (!vars || !TEMPLATE_EXTENSIONS.has(fileExtension(srcPath))) return raw;
+  let text = raw.toString("utf-8");
+  for (const [placeholder, value] of Object.entries(vars)) {
+    if (!/^\{\{[A-Z0-9_]+\}\}$/.test(placeholder)) continue;
+    if (!text.includes(placeholder)) continue;
+    text = text.split(placeholder).join(value);
+  }
+  return Buffer.from(text, "utf-8");
+}
+
+/** Atomic replace: sibling tmp at the payload's mode, then rename over the target. */
+function writeAtomic(dst: string, content: Buffer, mode: number): void {
+  mkdirSync(dirname(dst), { recursive: true });
+  const tmp = `${dst}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    writeFileSync(tmp, content, { mode });
+    renameSync(tmp, dst);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* the original failure is what the caller needs */ }
+    throw err;
+  }
+}
+
+export function copyChanged(src: string, dst: string, opts: CopyChangedOptions = {}): CopyChangedResult {
+  const r: CopyChangedResult = { added: [], updated: [], unchanged: 0, skippedSymlink: [], skippedDir: [], orphans: [], skippedProtected: [], verified: 0, failures: [] };
+  const fail = (what: string, err: unknown): void => {
+    r.failures.push(`${what}: ${err instanceof Error ? err.message : String(err)}`);
+  };
+
+  const placeFile = (sp: string, dp: string, rel: string): void => {
+    let rendered: Buffer;
+    try { rendered = renderPayloadFile(sp, opts.vars); } catch (err) { fail(`read ${sp}`, err); return; }
+    const after = sha256(rendered);
+    let before: string | undefined;
+    if (existsSync(dp)) {
+      const st = lstatSync(dp);
+      if (st.isSymbolicLink()) { r.skippedSymlink.push(dp); return; }
+      if (!st.isFile()) { r.failures.push(`${dp}: destination is neither a file nor a symlink — not touched`); return; }
+      try { before = sha256(readFileSync(dp)); } catch (err) { fail(`read ${dp}`, err); return; }
+      if (opts.protect?.(rel)) { r.skippedProtected.push({ path: dp, differs: before !== after }); return; }
+      if (before === after) { r.unchanged++; return; }
+    }
+    if (before === undefined) r.added.push(dp);
+    else r.updated.push({ path: dp, before, after });
+    if (opts.dryRun) return;
+    try {
+      if (before !== undefined && opts.backupDir) {
+        const bk = join(opts.backupDir, rel);
+        mkdirSync(dirname(bk), { recursive: true });
+        cpSync(dp, bk);
+      }
+      writeAtomic(dp, rendered, statSync(sp).mode & 0o777);
+      if (sha256(readFileSync(dp)) === after) r.verified++;
+      else r.failures.push(`${dp}: read-back hash differs from the intended content`);
+    } catch (err) {
+      fail(`${sp} → ${dp}`, err);
+    }
+  };
+
+  const walk = (s: string, d: string, rel: string): void => {
+    if (!existsSync(s)) return;
+    if (lstatSync(s).isFile()) { placeFile(s, d, rel); return; }
+    if (existsSync(d) && lstatSync(d).isSymbolicLink()) { r.skippedSymlink.push(d); return; }
+    const srcEntries = readdirSync(s, { withFileTypes: true });
+    const names = new Set<string>();
+    for (const entry of srcEntries) {
+      names.add(entry.name);
+      const sp = join(s, entry.name);
+      const dp = join(d, entry.name);
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (SKIP_DIRS.has(entry.name)) { r.skippedDir.push(dp); continue; }
+      if (entry.isDirectory()) {
+        if (existsSync(dp) && lstatSync(dp).isSymbolicLink()) { r.skippedSymlink.push(dp); continue; }
+        if (!opts.dryRun && !existsSync(dp)) {
+          try { mkdirSync(dp, { recursive: true }); } catch (err) { fail(`mkdir ${dp}`, err); continue; }
+        }
+        walk(sp, dp, childRel);
+      } else if (entry.isFile()) {
+        placeFile(sp, dp, childRel);
+      }
+      // a symlink or special file INSIDE the payload is not something we ship; ignored
+    }
+    // Orphan scan: what dst holds that the payload does not. Reported only.
+    if (!existsSync(d)) return;
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      if (names.has(entry.name) || SKIP_DIRS.has(entry.name) || entry.isSymbolicLink()) continue;
+      if (/\.tmp\.\d+\.\d+$/.test(entry.name)) continue;
+      r.orphans.push(entry.isDirectory() ? `${join(d, entry.name)}/` : join(d, entry.name));
+    }
+  };
+
+  walk(src, dst, "");
+  return r;
+}
+
+/**
+ * The identity vars an update must render — read from the canonical
+ * `<configRoot>/LIFEOS/USER/CONFIG/LIFEOS_CONFIG.toml` (the same source the
+ * hook layer's identity loader reads first) plus the payload's VERSION file.
+ * A minimal section/key reader on purpose: this module imports nothing outside
+ * node builtins, and the four keys it needs are flat strings.
+ *
+ * Tokens are assembled from bare keys, never written literally — see the note
+ * on IDENTITY_PLACEHOLDER_KEYS.
+ */
+export function readIdentityVars(configRoot: string, version: string): { vars: TemplateVars; source: string; missing: string[] } {
+  const source = join(configRoot, "LIFEOS", "USER", "CONFIG", "LIFEOS_CONFIG.toml");
+  const missing: string[] = [];
+  const sections = new Map<string, Map<string, string>>();
+  if (existsSync(source)) {
+    let current = "";
+    for (const rawLine of readFileSync(source, "utf-8").split("\n")) {
+      const line = rawLine.trim();
+      const sec = line.match(/^\[([A-Za-z0-9_.-]+)\]/);
+      if (sec) { current = sec[1]; if (!sections.has(current)) sections.set(current, new Map()); continue; }
+      const kv = line.match(/^([A-Za-z0-9_-]+)\s*=\s*"((?:[^"\\]|\\.)*)"/);
+      if (kv && current) sections.get(current)!.set(kv[1], kv[2]);
+    }
+  } else {
+    missing.push(source);
+  }
+  const get = (section: string, key: string): string | undefined => sections.get(section)?.get(key);
+  const token = (k: string): string => "{{" + k + "}}";
+  const vars: TemplateVars = {};
+  const principal = get("principal", "name");
+  const da = get("da", "name");
+  if (principal) {
+    vars[token("PRINCIPAL_NAME")] = principal;
+    vars[token("PRINCIPAL_FULL_NAME")] = get("principal", "full_name") || principal;
+  } else {
+    missing.push("[principal] name");
+  }
+  if (da) {
+    vars[token("DA_NAME")] = da;
+    vars[token("DA_FULL_NAME")] = get("da", "full_name") || da;
+  } else {
+    missing.push("[da] name");
+  }
+  const primaryVoice = get("da.voices.main", "voice_id");
+  const secondaryVoice = get("da.voices.algorithm", "voice_id");
+  if (primaryVoice) vars[token("PRIMARY_VOICE_ID")] = primaryVoice;
+  if (secondaryVoice) vars[token("SECONDARY_VOICE_ID")] = secondaryVoice;
+  if (version) vars[token("LIFEOS_VERSION")] = version;
+  else missing.push("payload VERSION");
+  return { vars, source, missing };
 }
 
 export interface TemplateVars {
