@@ -107,6 +107,7 @@ NO other text.
 
 ```bash
 bun run ~/.claude/skills/Art/Tools/Generate.ts \
+  --workflow=Essay \
   --model nano-banana-pro \
   --prompt "[YOUR PROMPT]" \
   --size 2K \

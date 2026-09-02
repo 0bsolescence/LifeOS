@@ -1,6 +1,6 @@
 # WriteReport Workflow
 
-**Purpose:** Generate a McKinsey-style professional consulting report from TELOS analysis content, rendered as a dark-themed web-based document with custom Practical Typography fonts and automatic light-mode print support.
+**Purpose:** Generate a McKinsey-style professional consulting report from TELOS analysis content, rendered as a dark-themed web-based document styled for Matthew Butterick's Practical Typography families (font files not shipped; system fallback) with automatic light-mode print support.
 
 ---
 
@@ -151,7 +151,7 @@ If artifacts don't exist, run the assessment workflow first (CreateNarrativePoin
 
 ```bash
 # Copy template to output directory (if not already done)
-cp -r ~/.claude/skills/Telos/report-template/* {output_dir}/
+cp -r ~/.claude/skills/Telos/ReportTemplate/* {output_dir}/
 
 # Install dependencies
 cd {output_dir} && bun install
@@ -298,9 +298,9 @@ When {PRINCIPAL.NAME} edits source files and says "regenerate the report":
 
 ### Typography (Practical Typography Fonts)
 
-**CRITICAL: Use Matthew Butterick's Practical Typography fonts (see font source below)**
+**The stylesheet targets Matthew Butterick's Practical Typography families (see font source below).**
 
-The report-template includes these fonts in `public/Fonts/`. The font stack is:
+The template declares this stack via `@font-face` pointing at `public/Fonts/`; the woff2 files are not shipped, so browsers fall back to the system stack until they are dropped in. The font stack is:
 
 ```css
 /* Font Families */
@@ -328,22 +328,7 @@ public/
 ├── ul-icon.png                    # UL connected nodes logo (blue)
 ```
 
-**Font Files Required:**
-
-```
-public/Fonts/
-├── advocate_34_narr_reg.woff2      # Advocate (narrow)
-├── advocate_54_wide_reg.woff2      # Advocate Wide (display)
-├── concourse_3_regular.woff2       # Concourse (sans)
-├── concourse_3_bold.woff2          # Concourse Bold
-├── concourse_4_regular.woff2       # Concourse Medium
-├── concourse_4_bold.woff2          # Concourse Medium Bold
-├── valkyrie_a_regular.woff2        # Valkyrie (serif body)
-├── valkyrie_a_bold.woff2           # Valkyrie Bold
-├── valkyrie_a_italic.woff2         # Valkyrie Italic
-├── heliotrope_3_regular.woff2      # Heliotrope
-└── heliotrope_3_caps_regular.woff2 # Heliotrope Caps (labels)
-```
+**Font files:** not shipped (commercially licensed; see `ReportTemplate/public/Fonts/FONTS-README.md`). The stylesheet references them and browsers fall back to the system stack. If the principal has licensed them, drop the woff2 files into `public/Fonts/`.
 
 ### Color Palette (Dark Theme)
 
@@ -411,7 +396,7 @@ The workflow generates a complete Next.js app:
 ```
 {output_dir}/
 ├── public/
-│   └── fonts/              # Practical Typography fonts (11 woff2 files)
+│   └── Fonts/              # font drop-in dir (see FONTS-README.md)
 ├── app/
 │   ├── layout.tsx          # Report shell with print styles
 │   ├── page.tsx            # Full report content
@@ -444,7 +429,7 @@ The workflow generates a complete Next.js app:
 
 # Step 1: {DA_IDENTITY.NAME} runs TELOS analysis on source directory
 # Step 2: {DA_IDENTITY.NAME} executes CreateNarrativePoints workflow
-# Step 3: {DA_IDENTITY.NAME} copies report-template to output directory
+# Step 3: {DA_IDENTITY.NAME} copies ReportTemplate to output directory
 # Step 4: {DA_IDENTITY.NAME} generates report-data.ts with content
 # Step 5: {DA_IDENTITY.NAME} runs bun install && bun dev
 
@@ -463,11 +448,11 @@ cd {output_dir} && bun dev
 **CRITICAL: The report template lives at:**
 
 ```
-~/.claude/skills/Telos/report-template/
+~/.claude/skills/Telos/ReportTemplate/
 ```
 
 This template includes:
-- All 11 Practical Typography font files
+- `@font-face` declarations for the Practical Typography families (font files supplied by the principal, or system fallback)
 - Pre-configured globals.css with @font-face declarations
 - Tailwind config with font family definitions
 - All McKinsey-style components
@@ -491,7 +476,7 @@ When generating a report:
 
 **Font Source:**
 - Fonts should be sourced from Practical Typography or your project's font directory
-- Already included in report-template for convenience
+- The `@font-face` declarations are already in ReportTemplate; only the woff2 files are missing
 
 **Works with:**
 - InterviewExtraction output (provides evidence quotes)
@@ -613,6 +598,6 @@ cp ~/Projects/[your-site]/public/Fonts/*.woff2 ~/.claude/skills/Telos/ReportTemp
 ```
 
 **To update template components:**
-Edit files in `~/.claude/skills/Telos/report-template/components/`
+Edit files in `~/.claude/skills/Telos/ReportTemplate/components/`
 
 **To change color scheme:**

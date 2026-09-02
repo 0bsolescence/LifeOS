@@ -73,10 +73,11 @@ When {PRINCIPAL.NAME} wants to update TELOS:
 # COMMANDS
 
 ## Update TELOS File (Guided)
-This is the main command you'll use. It takes three parameters:
+This is the main command you'll use. It takes three positional parameters and one optional flag:
 - File name (e.g., BOOKS.md, BELIEFS.md)
 - Content to add (the actual text)
 - Description of the change (for the changelog)
+- `--section "<heading>"` — required for section-structured files like `TELOS.md`; content lands at the end of that section and the tool fails closed if the heading is absent (without it content appends at EOF)
 
 !`FILE="$1"; CONTENT="$2"; DESCRIPTION="$3"; bun ~/.claude/skills/Telos/Tools/UpdateTelos.ts "$FILE" "$CONTENT" "$DESCRIPTION"`
 
@@ -274,10 +275,10 @@ Standing directive ({PRINCIPAL.NAME}, 2026-08-12): the personal TELOS and the pr
 ## Backup System
 
 The update-telos script automatically:
-1. Creates timestamped backup in `backups/` directory
+1. Creates a timestamped backup in `Backups/`
 2. Logs change to `updates.md` with full context
 3. Preserves complete version history
-4. Uses Pacific Time for all timestamps
+4. Stamps with the principal's configured timezone (UTC fallback)
 
 ---
 
@@ -288,10 +289,10 @@ The TypeScript implementation handles:
 - Automatic timestamped backups
 - Change logging in updates.md
 - Content appending (preserves existing content)
-- Pacific Time timezone for consistency
+- Timestamps in the principal's timezone (UTC fallback)
 
 The script is at: `~/.claude/skills/Telos/Tools/UpdateTelos.ts`
 
 All backups are stored in: `~/.claude/LIFEOS/USER/TELOS/Backups/`
 
-All changes are logged in the `## Changelog` section at the bottom of `~/.claude/LIFEOS/USER/TELOS/TELOS.md`.
+All changes are logged to `~/.claude/LIFEOS/USER/TELOS/updates.md` (`Updates.md` honoured on older installs).

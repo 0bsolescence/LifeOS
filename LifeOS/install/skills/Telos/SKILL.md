@@ -145,7 +145,7 @@ All files located in `~/.claude/LIFEOS/USER/TELOS/`:
 ### Life Data
 - **BOOKS.md** - Favorite books
 - **MOVIES.md** - Favorite movies
-- **LEARNED.md** - Lessons learned over time
+- **LESSONS.md** - Lessons learned over time
 - **WRONG.md** - Things {PRINCIPAL.NAME} was wrong about (growth tracking)
 
 ### Mental Models
@@ -191,7 +191,7 @@ The workflow provides:
 - Proper formatting and structure
 
 **Valid files for updates:**
-BELIEFS.md, BOOKS.md, CHALLENGES.md, FRAMES.md, GOALS.md, LEARNED.md, MISSION.md, MODELS.md, MOVIES.md, NARRATIVES.md, PREDICTIONS.md, PROBLEMS.md, PROJECTS.md, STRATEGIES.md, TELOS.md, TRAUMAS.md, WISDOM.md, WRONG.md
+BELIEFS.md, BOOKS.md, CHALLENGES.md, FRAMES.md, GOALS.md, LESSONS.md, MISSION.md, MODELS.md, MOVIES.md, NARRATIVES.md, PREDICTIONS.md, PROBLEMS.md, PROJECTS.md, STRATEGIES.md, TELOS.md, TRAUMAS.md, WISDOM.md, WRONG.md (authoritative list: `VALID_FILES` in `Tools/UpdateTelos.ts`)
 
 ---
 

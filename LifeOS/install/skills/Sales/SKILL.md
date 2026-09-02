@@ -48,7 +48,7 @@ The pipeline runs in four steps, from raw docs to a finished package:
 ```
 PRODUCT DOCUMENTATION
         ↓
-[1] STORY EXPLANATION — Extract the narrative arc (what's the real value?)
+[1] NARRATIVE ARC — Extract the arc (what's the real value?)
         ↓
 [2] EMOTIONAL REGISTER — What feeling should this evoke? (wonder, determination, hope, etc.)
         ↓
@@ -59,7 +59,7 @@ PRODUCT DOCUMENTATION
 SALES-READY OUTPUT
 ```
 
-It produces three things: sales narratives (story explanations that capture the value proposition), visual assets (charcoal sketch art that conveys the concept), and scripts (clear, succinct messaging tied to what you're selling). Internally it leans on the story-explanation narrative engine and the Art essay-art workflow for the visual.
+It produces three things: sales narratives (story explanations that capture the value proposition), visual assets (charcoal sketch art that conveys the concept), and scripts (clear, succinct messaging tied to what you're selling). Internally it derives a 24-beat narrative arc inline (`Skill("WriteStory")` when a story form is wanted) and uses the Art essay-art workflow for the visual.
 
 ---
 
@@ -77,7 +77,7 @@ It produces three things: sales narratives (story explanations that capture the 
 ## Output Format
 
 ### Sales Narrative
-- 8-24 point story explanation
+- 8-24 point narrative arc
 - First person, conversational
 - Captures the "why this matters" not just "what it does"
 - Ready for sales scripts, presentations, pitches
@@ -107,7 +107,7 @@ It produces three things: sales narratives (story explanations that capture the 
 ## Integration
 
 This skill combines:
-- **A story-explanation skill** - For narrative extraction
+- **WriteStory** - For narrative form when the package wants a story
 - **art skill (essay-art workflow)** - For visual generation
 - **Sales-specific framing** - Value proposition focus
 
@@ -122,7 +122,7 @@ This skill combines:
 **Example 1: Full sales package from docs**
 ```
 User: "create a sales package for this product" [provides docs]
-→ Extracts narrative arc using storyexplanation
+→ Extracts the narrative arc as ordered beats
 → Determines emotional register (wonder, determination, hope)
 → Generates charcoal sketch visual + narrative + talking points
 ```
@@ -131,7 +131,7 @@ User: "create a sales package for this product" [provides docs]
 ```
 User: "turn this technical doc into a sales pitch"
 → Reads documentation and extracts value proposition
-→ Creates 8-24 point story explanation in first person
+→ Creates an 8-24 point narrative arc in first person
 → Returns conversational narrative ready for sales scripts
 ```
 

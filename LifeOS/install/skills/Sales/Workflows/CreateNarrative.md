@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Takes technical documentation, product specs, or feature descriptions and produces a story explanation focused on VALUE — why this matters to the customer, not just what it does.
+Takes technical documentation, product specs, or feature descriptions and produces a narrative arc focused on VALUE — why this matters to the customer, not just what it does.
 
 ---
 
@@ -21,12 +21,12 @@ Takes technical documentation, product specs, or feature descriptions and produc
 - Marketing copy (to improve)
 - URL to product page
 
-### Step 2: Extract Narrative with Story Explanation
+### Step 2: Extract the Narrative Arc
 
-**Use the StoryExplanation Skill:**
+**Extract the beats:**
 
 ```
-Invoke StoryExplanation Skill with 24-item length for [input content]
+Produce 24 ordered narrative beats from [input content] (`Skill("WriteStory")` when a story form is wanted)
 ```
 
 **Frame the analysis around:**
@@ -37,7 +37,7 @@ Invoke StoryExplanation Skill with 24-item length for [input content]
 
 ### Step 3: Refine for Sales
 
-**Transform the story explanation into sales-ready narrative:**
+**Transform the beats into a sales-ready narrative:**
 
 1. **Lead with the pain point** — What problem are they facing?
 2. **Introduce the transformation** — What changes with this product?

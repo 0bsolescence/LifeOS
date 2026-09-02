@@ -5,7 +5,7 @@
 Creating, modifying structure of, or validating any skill under this directory
 REQUIRES invoking `Skill("CreateSkill")` first. Reading CreateSkill's workflows
 and executing the steps by hand is NOT compliance — it is the exact
-handrolling anti-pattern documented in feedback_invoke_blogging_skill_never_handroll.md.
+handrolling anti-pattern the skill exists to prevent.
 
 ### Triggers (MUST invoke CreateSkill)
 

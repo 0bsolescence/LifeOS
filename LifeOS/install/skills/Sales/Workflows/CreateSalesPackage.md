@@ -9,7 +9,7 @@
 ```
 PRODUCT DOCUMENTATION
         ↓
-[1] STORY EXPLANATION — Extract narrative arc with StoryExplanation Skill
+[1] NARRATIVE ARC — Extract the arc as ordered beats
         ↓
 [2] EMOTIONAL REGISTER — Match to emotion from aesthetic vocabulary
         ↓
@@ -22,12 +22,12 @@ PRODUCT DOCUMENTATION
 
 ---
 
-## Step 1: Extract Narrative with Story Explanation
+## Step 1: Extract the Narrative Arc
 
-**Use the StoryExplanation Skill to extract the narrative arc.**
+**Extract the narrative arc as 24 beats** (`Skill("WriteStory")` if a story form is wanted; otherwise do it inline).
 
 ```
-Invoke StoryExplanation Skill with 24-item length for [product documentation]
+Produce 24 ordered beats (problem → stakes → turn → resolution) from [product documentation]
 ```
 
 **Focus on:**
@@ -36,7 +36,7 @@ Invoke StoryExplanation Skill with 24-item length for [product documentation]
 - What problem does this SOLVE?
 - What's the transformation (before → after)?
 
-**Output:** 8-24 point story explanation capturing the value proposition.
+**Output:** 8-24 point narrative arc capturing the value proposition.
 
 ---
 
@@ -158,6 +158,7 @@ NO other text.
 
 ```bash
 bun run ~/.claude/skills/Art/Tools/Generate.ts \
+  --workflow=Essay \
   --model nano-banana-pro \
   --prompt "[YOUR PROMPT]" \
   --size 2K \
@@ -181,7 +182,7 @@ bun run ~/.claude/skills/Art/Tools/Generate.ts \
 
 ## Sales Narrative
 
-[8-24 point story explanation from Step 1]
+[8-24 point narrative arc from Step 1]
 
 ## Visual Asset
 
@@ -245,4 +246,4 @@ Before delivering:
 
 ---
 
-**The workflow: Story Explanation → Emotion → Visual Concept → Generate → Compile**
+**The workflow: Narrative Arc → Emotion → Visual Concept → Generate → Compile**
