@@ -104,7 +104,10 @@ let defaultVoiceId = ""
 let providerChain: VoiceProvider[] = []
 let initialized = false
 
-const DEFAULT_SYNTH_TIMEOUT_MS = 15_000
+// Per-provider synthesis budget. The VoiceNotification hook waits 30s on
+// /notify, so a two-link chain can exhaust both budgets before the caller
+// gives up (codex P2, 2026-09-01). Local Kokoro answers in well under 2s.
+const DEFAULT_SYNTH_TIMEOUT_MS = 10_000
 
 function describeProvider(p: VoiceProvider): string {
   return p.type === "openai-compatible"
@@ -645,6 +648,13 @@ async function sendNotification(
   let engine: string | undefined
   let usedVoice: string | undefined
 
+  if (voiceEnabled && providerChain.length === 0) {
+    // An empty chain is a failure the caller must see, never a silent 200:
+    // the voice-events record would otherwise say "sent" for silence.
+    voiceError = "no voice provider configured"
+    log("error", "Voice: request refused — no voice provider configured")
+  }
+
   if (voiceEnabled && providerChain.length > 0) {
     try {
       const voice = voiceId || defaultVoiceId
@@ -754,13 +764,21 @@ export function startVoice(config: VoiceConfig): void {
   // Provider chain: a declared chain is exhaustive; otherwise an ElevenLabs
   // key yields the legacy single-provider chain; otherwise the chain is empty
   // and every /notify reports 502 rather than pretending to speak.
+  // A chain that was DECLARED (the key exists, even if empty or malformed) is
+  // exhaustive — legacy ElevenLabs fallback is only ever constructed when the
+  // operator never wrote [[voice.providers]] at all (codex P1, 2026-09-01: a
+  // misspelled type must not silently route to a paid API).
+  const chainDeclared = config.providers !== undefined
   const declared = Array.isArray(config.providers) ? config.providers : []
   const valid = declared.filter((p) => p && (p.type === "openai-compatible" || p.type === "elevenlabs"))
   if (valid.length !== declared.length) {
-    log("warn", `Voice module: ignored ${declared.length - valid.length} provider(s) with unknown type`)
+    log("error", `Voice module: ${declared.length - valid.length} declared provider(s) have an unknown type and were dropped — no fallback`)
   }
   if (valid.length > 0) {
     providerChain = valid
+  } else if (chainDeclared) {
+    providerChain = []
+    log("error", "Voice module: [[voice.providers]] declared but no valid entries — voice will be silent (declared chains never fall back)")
   } else if (config.elevenlabs_api_key) {
     providerChain = [{ type: "elevenlabs", api_key: config.elevenlabs_api_key }]
   } else {

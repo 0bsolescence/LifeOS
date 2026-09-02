@@ -113,7 +113,9 @@ async function sendNotification(payload: ElevenLabsNotificationPayload, sessionI
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10000), // 10s timeout - ElevenLabs TTS takes ~4s, need headroom
+      // Must outlast the server's whole provider chain (10s per link by default)
+      // or the record logs a failure while audio still plays (codex P2).
+      signal: AbortSignal.timeout(30000),
     });
 
     if (!response.ok) {
