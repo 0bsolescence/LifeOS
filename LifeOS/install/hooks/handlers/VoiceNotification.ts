@@ -113,8 +113,10 @@ async function sendNotification(payload: ElevenLabsNotificationPayload, sessionI
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      // Must outlast the server's whole provider chain (10s per link by default)
-      // or the record logs a failure while audio still plays (codex P2).
+      // /notify answers once audio is synthesized and queued (never waits for
+      // the speaker), so this only has to outlast the provider chain: 10s per
+      // link by default. 30s covers a three-link chain at defaults; a longer
+      // or slower chain is a config choice that should raise this too.
       signal: AbortSignal.timeout(30000),
     });
 

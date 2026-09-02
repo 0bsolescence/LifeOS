@@ -716,7 +716,15 @@ async function sendNotification(
       const synthesized = await generateSpeech(safeMessage, voice, resolvedSettings)
       engine = synthesized.engine
       usedVoice = synthesized.voice
-      await enqueuePlayback(() => playAudio(synthesized.audio, resolvedVolume))
+      // Respond once audio exists and is queued; do NOT hold the request open
+      // for the speaker. Playback is serialized and can legitimately wait
+      // behind earlier messages (up to the 90s hang watchdog each), so a
+      // caller that awaited it would time out and record "failed" for audio
+      // that then plays (codex P2, 2026-09-01). Playback failures are logged
+      // here — the record's "sent" means synthesized-and-queued.
+      enqueuePlayback(() => playAudio(synthesized.audio, resolvedVolume)).catch((error) => {
+        log("error", "Voice: queued playback failed", { error: String(error), engine: synthesized.engine })
+      })
       voicePlayed = true
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error)
