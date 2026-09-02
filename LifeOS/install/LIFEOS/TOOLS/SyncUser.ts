@@ -172,12 +172,26 @@ function cmdSync(): void {
 
   const pull = git(["pull", "--rebase"]);
   if (pull.code !== 0) {
-    console.error("❌ REBASE CONFLICT — halting. Your files are untouched on disk.\n");
-    console.error(pull.err || pull.out);
-    console.error("\nResolve deliberately, then re-run:");
-    console.error(`  cd ${CONFIG_DIR} && git status`);
-    console.error("  # edit the conflicted files, then: git add -A && git rebase --continue");
-    console.error("  # or abandon this pull entirely: git rebase --abort");
+    // Only call it a conflict when a rebase is actually in progress. A pull
+    // that died before touching history (ssh refused, remote unreachable,
+    // auth) is a different failure with a different fix — labelling it a
+    // conflict sent a day of diagnosis the wrong way (2026-09-01: a sandboxed
+    // unit's ssh error was recorded as "rebase conflict" in the handoff).
+    const rebasing = existsSync(join(CONFIG_DIR, ".git", "rebase-merge")) ||
+      existsSync(join(CONFIG_DIR, ".git", "rebase-apply"));
+    if (rebasing) {
+      console.error("❌ REBASE CONFLICT — halting. Your files are untouched on disk.\n");
+      console.error(pull.err || pull.out);
+      console.error("\nResolve deliberately, then re-run:");
+      console.error(`  cd ${CONFIG_DIR} && git status`);
+      console.error("  # edit the conflicted files, then: git add -A && git rebase --continue");
+      console.error("  # or abandon this pull entirely: git rebase --abort");
+    } else {
+      console.error("❌ PULL FAILED before any rebase (remote/ssh/auth) — nothing changed locally.\n");
+      console.error(pull.err || pull.out);
+      console.error(`\nProbe the transport the same way the unit does, then re-run:`);
+      console.error(`  cd ${CONFIG_DIR} && git ls-remote --heads origin`);
+    }
     process.exit(1);
   }
   console.log(pull.out.split("\n").slice(-2).join("\n") || "up to date");
