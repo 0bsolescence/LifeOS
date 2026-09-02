@@ -114,10 +114,13 @@ async function sendNotification(payload: ElevenLabsNotificationPayload, sessionI
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       // /notify answers once audio is synthesized and queued (never waits for
-      // the speaker), so this only has to outlast the provider chain: 10s per
-      // link by default. 30s covers a three-link chain at defaults; a longer
-      // or slower chain is a config choice that should raise this too.
-      signal: AbortSignal.timeout(30000),
+      // the speaker), so this only has to outlast the provider chain. The
+      // server's per-link budget scales with text and caps at 50s (CPU Kokoro
+      // measured ~80 ms/char, 2026-09-01); 55s outlasts one link at the cap
+      // and stays under the harness's 60s Stop-hook default. A chain whose
+      // first link hangs at the cap before a second succeeds will still be
+      // recorded failed — that is the configured cost of a hanging link.
+      signal: AbortSignal.timeout(55000),
     });
 
     if (!response.ok) {

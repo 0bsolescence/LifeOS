@@ -104,10 +104,20 @@ let defaultVoiceId = ""
 let providerChain: VoiceProvider[] = []
 let initialized = false
 
-// Per-provider synthesis budget. The VoiceNotification hook waits 30s on
-// /notify, so a two-link chain can exhaust both budgets before the caller
-// gives up (codex P2, 2026-09-01). Local Kokoro answers in well under 2s.
-const DEFAULT_SYNTH_TIMEOUT_MS = 10_000
+// Per-provider synthesis budget scales with the text. Measured 2026-09-01 on a
+// 12-core i7-1365U running Kokoro on CPU: 11 chars → 2.6s, 301 chars → 24.4s
+// (~80 ms/char plus ~2s floor). A fixed 10s budget would have failed every
+// closer over ~100 chars. 100 ms/char + 5s, capped at 50s so the 500-char
+// message cap fits and the VoiceNotification hook (55s) still outlasts one
+// link. `timeout_ms` on the provider overrides the formula outright.
+const SYNTH_MS_PER_CHAR = 100
+const SYNTH_FLOOR_MS = 5_000
+const SYNTH_CAP_MS = 50_000
+
+function synthBudgetMs(provider: VoiceProvider, text: string): number {
+  if (provider.timeout_ms) return provider.timeout_ms
+  return Math.min(SYNTH_CAP_MS, SYNTH_FLOOR_MS + SYNTH_MS_PER_CHAR * text.length)
+}
 
 function describeProvider(p: VoiceProvider): string {
   return p.type === "openai-compatible"
@@ -389,7 +399,7 @@ async function synthesizeElevenLabs(
       model_id: "eleven_turbo_v2_5",
       voice_settings: voiceSettings,
     }),
-    signal: AbortSignal.timeout(provider.timeout_ms ?? DEFAULT_SYNTH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(synthBudgetMs(provider, text)),
   })
 
   if (!response.ok) {
@@ -425,7 +435,7 @@ async function synthesizeOpenAICompatible(
       response_format: "mp3",
       speed: voiceSettings.speed ?? 1.0,
     }),
-    signal: AbortSignal.timeout(provider.timeout_ms ?? DEFAULT_SYNTH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(synthBudgetMs(provider, text)),
   })
 
   if (!response.ok) {
