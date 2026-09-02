@@ -44,7 +44,9 @@ interface VoiceEvent {
   event_type: 'sent' | 'failed' | 'skipped';
   message: string;
   character_count: number;
-  voice_engine: 'elevenlabs';
+  /** Engine that actually spoke, as reported by Pulse /notify (kokoro,
+   *  elevenlabs, …). 'unknown' when the server did not say. */
+  voice_engine: string;
   voice_id: string;
   status_code?: number;
   error?: string;
@@ -100,12 +102,13 @@ async function sendNotification(payload: ElevenLabsNotificationPayload, sessionI
     session_id: sessionId,
     message: payload.message,
     character_count: payload.message.length,
-    voice_engine: 'elevenlabs',
+    voice_engine: 'unknown',
     voice_id: voiceId,
   };
 
   try {
-    // Use ElevenLabs voice server /notify endpoint
+    // Pulse /notify runs the configured provider chain and reports which
+    // engine spoke; the record names that engine, never an assumed one.
     const response = await fetch(`${PULSE_BASE}/notify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -122,12 +125,22 @@ async function sendNotification(payload: ElevenLabsNotificationPayload, sessionI
         error: response.statusText,
       });
     } else {
+      let engine = 'unknown';
+      let spokenVoice = voiceId;
+      try {
+        const body = (await response.json()) as { engine?: string | null; voice?: string | null };
+        if (body.engine) engine = body.engine;
+        if (body.voice) spokenVoice = body.voice;
+      } catch {
+        // Older server without engine reporting — keep 'unknown'
+      }
       logVoiceEvent({
         ...baseEvent,
+        voice_engine: engine,
+        voice_id: spokenVoice,
         event_type: 'sent',
         status_code: response.status,
       });
-
     }
   } catch (error) {
     console.error('[Voice] Failed to send:', error);

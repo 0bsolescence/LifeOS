@@ -1,10 +1,23 @@
 /**
  * LifeOS Pulse — Voice Module
  *
- * ElevenLabs TTS, macOS notifications, pronunciation preprocessing.
- * Absorbed from VoiceServer/server.ts into a Pulse-embeddable module.
+ * TTS through an ordered provider chain, macOS notifications, pronunciation
+ * preprocessing. Absorbed from VoiceServer/server.ts into a Pulse-embeddable
+ * module.
  *
- * Config resolution (3-tier):
+ * Provider chain (PULSE.toml `[[voice.providers]]`, tried in order, first
+ * success wins):
+ *   type = "openai-compatible"  base_url, model, voice   — Kokoro, Orpheus, any
+ *                                /v1/audio/speech server; no key needed locally
+ *   type = "elevenlabs"         api_key / api_key_env, voice — the hosted path
+ * With no providers declared, an ElevenLabs key (config or env) yields the
+ * legacy single-provider chain so unconfigured installs behave as before. A
+ * declared chain is exhaustive: nothing outside it is ever called, so a
+ * local-only chain never falls through to a paid API (principal ruling
+ * 2026-09-01: "Kokoro or nothing").
+ *
+ * Voice-settings resolution (3-tier, ElevenLabs semantics; openai-compatible
+ * providers honour `speed` only):
  *   1. Caller sends voice_settings in request body → use directly (pass-through)
  *   2. Caller sends voice_id → look up in settings.json daidentity.voices → use those settings
  *   3. Neither → use settings.json daidentity.voices.main as default
@@ -22,8 +35,23 @@ import { homedir } from "node:os";
 
 // ── Public Config Interface ──
 
+export interface VoiceProvider {
+  type: "openai-compatible" | "elevenlabs"
+  /** openai-compatible: server root, e.g. http://127.0.0.1:8880 (no trailing path) */
+  base_url?: string
+  /** openai-compatible: model name the server expects (Kokoro: "kokoro") */
+  model?: string
+  /** Provider-native voice id (Kokoro: "bm_george"; ElevenLabs: a voice id) */
+  voice?: string
+  api_key?: string
+  api_key_env?: string
+  /** Per-request synthesis timeout; default 15s */
+  timeout_ms?: number
+}
+
 export interface VoiceConfig {
   enabled: boolean
+  providers?: VoiceProvider[]
   elevenlabs_api_key?: string
   default_voice_id?: string
   pronunciations_path?: string
@@ -73,7 +101,16 @@ let moduleConfig: VoiceConfig = { enabled: false }
 let pronunciationRules: CompiledRule[] = []
 let voiceConfig: LoadedVoiceConfig = { defaultVoiceId: "", voices: {}, voicesByVoiceId: {}, desktopNotifications: true }
 let defaultVoiceId = ""
+let providerChain: VoiceProvider[] = []
 let initialized = false
+
+const DEFAULT_SYNTH_TIMEOUT_MS = 15_000
+
+function describeProvider(p: VoiceProvider): string {
+  return p.type === "openai-compatible"
+    ? `${p.model ?? "?"}@${p.base_url ?? "?"}`
+    : "elevenlabs"
+}
 
 // ── Constants ──
 
@@ -319,22 +356,25 @@ function escapeForAppleScript(input: string): string {
 
 // ── TTS Generation ──
 
-async function generateSpeech(
+interface SynthesisResult {
+  audio: ArrayBuffer
+  /** Which provider produced the audio — surfaced in the /notify response so
+   *  the caller's voice-events record names the engine that actually spoke. */
+  engine: string
+  voice: string
+}
+
+async function synthesizeElevenLabs(
+  provider: VoiceProvider,
   text: string,
   voiceId: string,
   voiceSettings: ElevenLabsVoiceSettings,
-): Promise<ArrayBuffer> {
-  const apiKey = moduleConfig.elevenlabs_api_key
+): Promise<SynthesisResult> {
+  const apiKey = provider.api_key || (provider.api_key_env ? process.env[provider.api_key_env] : undefined)
   if (!apiKey) throw new Error("ElevenLabs API key not configured")
 
-  const pronouncedText = applyPronunciations(disambiguateHomographs(text))
-  if (pronouncedText !== text) {
-    log("info", `Voice pronunciation: "${text}" -> "${pronouncedText}"`)
-  }
-
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`
-
-  const response = await fetch(url, {
+  const voice = provider.voice || voiceId
+  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}`, {
     method: "POST",
     headers: {
       Accept: "audio/mpeg",
@@ -342,10 +382,11 @@ async function generateSpeech(
       "xi-api-key": apiKey,
     },
     body: JSON.stringify({
-      text: pronouncedText,
+      text,
       model_id: "eleven_turbo_v2_5",
       voice_settings: voiceSettings,
     }),
+    signal: AbortSignal.timeout(provider.timeout_ms ?? DEFAULT_SYNTH_TIMEOUT_MS),
   })
 
   if (!response.ok) {
@@ -353,7 +394,81 @@ async function generateSpeech(
     throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`)
   }
 
-  return await response.arrayBuffer()
+  return { audio: await response.arrayBuffer(), engine: "elevenlabs", voice }
+}
+
+// OpenAI `/v1/audio/speech` shape — Kokoro-FastAPI, Orpheus, LocalAI and the
+// real OpenAI endpoint all speak it. Only `speed` carries over from the
+// ElevenLabs settings; stability/similarity/style have no analogue here.
+async function synthesizeOpenAICompatible(
+  provider: VoiceProvider,
+  text: string,
+  voiceSettings: ElevenLabsVoiceSettings,
+): Promise<SynthesisResult> {
+  if (!provider.base_url) throw new Error("openai-compatible provider has no base_url")
+  const voice = provider.voice || "af_heart"
+  const model = provider.model || "kokoro"
+  const headers: Record<string, string> = { Accept: "audio/mpeg", "Content-Type": "application/json" }
+  const apiKey = provider.api_key || (provider.api_key_env ? process.env[provider.api_key_env] : undefined)
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+
+  const response = await fetch(`${provider.base_url.replace(/\/+$/, "")}/v1/audio/speech`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      input: text,
+      voice,
+      response_format: "mp3",
+      speed: voiceSettings.speed ?? 1.0,
+    }),
+    signal: AbortSignal.timeout(provider.timeout_ms ?? DEFAULT_SYNTH_TIMEOUT_MS),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`${model}@${provider.base_url} error: ${response.status} - ${errorText}`)
+  }
+
+  return { audio: await response.arrayBuffer(), engine: model, voice }
+}
+
+// Walk the chain in declared order; the first provider that returns audio
+// wins. Every failure is logged with its provider so a silent fall-through is
+// impossible to miss in the journal. Exhausting the chain throws the joined
+// errors — the caller reports 502, never a fake success.
+async function generateSpeech(
+  text: string,
+  voiceId: string,
+  voiceSettings: ElevenLabsVoiceSettings,
+): Promise<SynthesisResult> {
+  if (providerChain.length === 0) throw new Error("no voice provider configured")
+
+  const pronouncedText = applyPronunciations(disambiguateHomographs(text))
+  if (pronouncedText !== text) {
+    log("info", `Voice pronunciation: "${text}" -> "${pronouncedText}"`)
+  }
+
+  const errors: string[] = []
+  for (const provider of providerChain) {
+    try {
+      const started = Date.now()
+      const result = provider.type === "openai-compatible"
+        ? await synthesizeOpenAICompatible(provider, pronouncedText, voiceSettings)
+        : await synthesizeElevenLabs(provider, pronouncedText, voiceId, voiceSettings)
+      log("info", `Voice: synthesized via ${describeProvider(provider)}`, {
+        ms: Date.now() - started,
+        bytes: result.audio.byteLength,
+      })
+      return result
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      errors.push(`${describeProvider(provider)}: ${msg}`)
+      log("warn", `Voice: provider ${describeProvider(provider)} failed — trying next`, { error: msg })
+    }
+  }
+
+  throw new Error(`all ${providerChain.length} voice provider(s) failed: ${errors.join(" | ")}`)
 }
 
 // ── Audio Playback ──
@@ -512,7 +627,7 @@ async function sendNotification(
   voiceId: string | null = null,
   callerVoiceSettings?: Partial<ElevenLabsVoiceSettings> | null,
   callerVolume?: number | null,
-): Promise<{ voicePlayed: boolean; voiceError?: string }> {
+): Promise<{ voicePlayed: boolean; voiceError?: string; engine?: string; voice?: string }> {
   const titleValidation = validateInput(title)
   const messageValidation = validateInput(message)
 
@@ -527,8 +642,10 @@ async function sendNotification(
 
   let voicePlayed = false
   let voiceError: string | undefined
+  let engine: string | undefined
+  let usedVoice: string | undefined
 
-  if (voiceEnabled && moduleConfig.elevenlabs_api_key) {
+  if (voiceEnabled && providerChain.length > 0) {
     try {
       const voice = voiceId || defaultVoiceId
 
@@ -586,8 +703,10 @@ async function sendNotification(
         volume: resolvedVolume,
       })
 
-      const audioBuffer = await generateSpeech(safeMessage, voice, resolvedSettings)
-      await enqueuePlayback(() => playAudio(audioBuffer, resolvedVolume))
+      const synthesized = await generateSpeech(safeMessage, voice, resolvedSettings)
+      engine = synthesized.engine
+      usedVoice = synthesized.voice
+      await enqueuePlayback(() => playAudio(synthesized.audio, resolvedVolume))
       voicePlayed = true
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error)
@@ -599,7 +718,7 @@ async function sendNotification(
   // macOS desktop notification
   await showDesktopNotification(safeTitle, safeMessage)
 
-  return { voicePlayed, voiceError }
+  return { voicePlayed, voiceError, engine, voice: usedVoice }
 }
 
 // ── JSON Error Response Helper ──
@@ -632,8 +751,21 @@ export function startVoice(config: VoiceConfig): void {
     return
   }
 
-  if (!config.elevenlabs_api_key) {
-    log("warn", "Voice module: ELEVENLABS_API_KEY not set in config or env")
+  // Provider chain: a declared chain is exhaustive; otherwise an ElevenLabs
+  // key yields the legacy single-provider chain; otherwise the chain is empty
+  // and every /notify reports 502 rather than pretending to speak.
+  const declared = Array.isArray(config.providers) ? config.providers : []
+  const valid = declared.filter((p) => p && (p.type === "openai-compatible" || p.type === "elevenlabs"))
+  if (valid.length !== declared.length) {
+    log("warn", `Voice module: ignored ${declared.length - valid.length} provider(s) with unknown type`)
+  }
+  if (valid.length > 0) {
+    providerChain = valid
+  } else if (config.elevenlabs_api_key) {
+    providerChain = [{ type: "elevenlabs", api_key: config.elevenlabs_api_key }]
+  } else {
+    providerChain = []
+    log("warn", "Voice module: no [[voice.providers]] declared and no ELEVENLABS_API_KEY — voice will be silent")
   }
 
   // Load pronunciation rules
@@ -650,10 +782,10 @@ export function startVoice(config: VoiceConfig): void {
 
   initialized = true
   log("info", "Voice module: initialized", {
+    providers: providerChain.map(describeProvider),
     defaultVoiceId,
     pronunciationRules: pronunciationRules.length,
     configuredVoices: Object.keys(voiceConfig.voices),
-    apiKeyConfigured: !!config.elevenlabs_api_key,
   })
 }
 
@@ -664,9 +796,12 @@ export function voiceHealth(): Record<string, unknown> {
   return {
     initialized,
     enabled: moduleConfig.enabled,
-    voice_system: "ElevenLabs",
+    voice_system: providerChain.length > 0 ? providerChain.map(describeProvider).join(" > ") : "none",
+    providers: providerChain.map((p) => ({ type: p.type, target: describeProvider(p), voice: p.voice ?? null })),
     default_voice_id: defaultVoiceId,
-    api_key_configured: !!moduleConfig.elevenlabs_api_key,
+    api_key_configured: providerChain.some(
+      (p) => !!(p.api_key || (p.api_key_env && process.env[p.api_key_env])),
+    ),
     pronunciation_rules: pronunciationRules.length,
     configured_voices: Object.keys(voiceConfig.voices),
     desktop_notifications: voiceConfig.desktopNotifications,
@@ -746,7 +881,10 @@ export async function handleVoiceRequest(req: Request): Promise<Response | null>
         return jsonResponse({ status: "error", message: `TTS failed: ${result.voiceError}`, notification_sent: true }, 502)
       }
 
-      return jsonResponse({ status: "success", message: "Notification sent" }, 200)
+      return jsonResponse(
+        { status: "success", message: "Notification sent", engine: result.engine ?? null, voice: result.voice ?? null },
+        200,
+      )
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error)
       log("error", "Voice: notification error", { error: msg })

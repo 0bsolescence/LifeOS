@@ -81,7 +81,7 @@ export function logSkippedVoice(opts: {
       reason: `remote_channel:${channel}`,
       message: opts.message,
       character_count: opts.message.length,
-      voice_engine: 'elevenlabs' as const,
+      voice_engine: 'none' as const,
     };
     const dir = paiPath('MEMORY', 'VOICE');
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
