@@ -40,6 +40,16 @@ const REGISTRY_PATH = join(import.meta.dir, "models.ts");
  */
 export const SCAN_EXCLUDES = [
   "node_modules",
+  // Append-only RECORDS of what actually ran: a historical ID in a log is the
+  // truth of that run, never a stale pin. Scanning them made --check report
+  // 4,382 phantom "stale" hits against 2 real code pins on 2026-09-03, which
+  // is how a drift check becomes something nobody runs.
+  "file-history/",              // harness file snapshots
+  "projects/",                  // session transcripts (they QUOTE ids verbatim)
+  "MEMORY/OBSERVABILITY/",      // session-costs, model-rung, tool-activity jsonl
+  "MEMORY/WORK/",               // handoffs, briefs and reports quote ids as evidence
+  "MEMORY/LEARNING/",           // captured transcripts
+  "MEMORY/STATE/",              // probe results and run state (carrier-probe.json records what EXECUTED)
   "LIFEOS_RELEASES",
   "profile-data",
   "plugins/",            // third-party marketplace plugins

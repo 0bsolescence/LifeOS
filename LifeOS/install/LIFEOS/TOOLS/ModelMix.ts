@@ -107,7 +107,7 @@ export interface Mix {
 const zero = (): Record<EffortLevel, number> => ({ max: 0, high: 0, medium: 0, low: 0 });
 
 /**
- * Model ID → rung. Matches the tier NAME inside the ID (claude-opus-5 → opus),
+ * Model ID → rung. Matches the tier NAME inside the ID (claude-opus-N → opus),
  * which survives version bumps without touching CURRENT. Falls back to an exact
  * CURRENT lookup for IDs that don't carry their tier name.
  * Returns null for anything unrecognized — never guess a rung.

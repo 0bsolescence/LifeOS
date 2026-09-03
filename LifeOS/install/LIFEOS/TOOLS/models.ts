@@ -68,7 +68,7 @@ export function pinnedModelForEffort(level: EffortLevel): string {
  * rewrites these safely.
  */
 export const CURRENT: Record<ClaudeTier, string> = {
-  fable: "claude-fable-5",
+  fable: "claude-fable-5-1",
   opus: "claude-opus-5",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5-20251001",

@@ -4,7 +4,7 @@
  * ============================================================================
  *
  * A page manifest names a MODEL (`model = "haiku"`, or a pinned id like
- * "claude-opus-5"); `Inference.ts` accepts a LEVEL. This module is the only
+ * "claude-opus-N"); `Inference.ts` accepts a LEVEL. This module is the only
  * bridge between the two, and it DERIVES the answer from `EFFORT_MODEL` in
  * LIFEOS/TOOLS/models.ts — the single source of truth for level → tier —
  * instead of restating level names locally.
@@ -41,7 +41,7 @@ export const DEFAULT_LEVEL: InferenceLevel = "medium";
 
 /**
  * Tier for a manifest `model` value — a tier alias ("opus") or a pinned id
- * ("claude-opus-5"). Tier names come from models.ts, so a new tier is
+ * ("claude-opus-N"). Tier names come from models.ts, so a new tier is
  * recognized without editing this file. Returns null for anything outside the
  * Claude lineup (a cross-vendor pin, a typo, an empty manifest field).
  */
