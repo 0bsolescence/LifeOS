@@ -1112,6 +1112,35 @@ async function main() {
   // public PR #1644, @elhoim
   const badScheduleJobs = new Set<string>()
 
+  // Heartbeat, independent of the run loop. state.json used to be written only
+
+  // after a job ran, so any quiet stretch over two minutes read as "tick stale"
+
+  // on every menu bar (2026-09-04). A write inside the loop was not enough: the
+
+  // loop blocks on a running job, and memory-consolidation is allowed 600s
+
+  // (codex review, same day). This timer keeps writing while a job runs, so the
+
+  // file's age means what readers assume: how long since the daemon last proved
+
+  // itself alive. writeState is atomic (tmp + rename), so it cannot interleave
+
+  // with the loop's own persist.
+
+  const heartbeat = setInterval(() => {
+
+    state.lastTick = Date.now()
+
+    writeState(STATE_PATH, state).catch((err) =>
+
+      log("error", "Failed to persist heartbeat", { error: String(err) })
+
+    )
+
+  }, 30_000)
+
+
   while (!shuttingDown) {
     const tickStart = Date.now()
     const now = new Date()
@@ -1199,22 +1228,13 @@ async function main() {
     const elapsed = Date.now() - tickStart
     const sleepMs = Math.max(MIN_SLEEP_MS, Math.min(nextDueMs - elapsed, MAX_SLEEP_MS))
 
-    // Heartbeat. state.json used to be written only after a job ran, so any
-    // quiet stretch over two minutes read as "tick stale" on every menu bar
-    // (2026-09-04). One small write per loop pass, at most once a minute given
-    // MAX_SLEEP_MS, makes the file's age mean what the readers assume: how long
-    // since this loop last came round.
-    state.lastTick = Date.now()
-    await writeState(STATE_PATH, state).catch((err) =>
-      log("error", "Failed to persist heartbeat", { error: String(err) })
-    )
-
     if (!shuttingDown) {
       await Bun.sleep(sleepMs)
     }
   }
 
   // ── Cleanup ──
+  clearInterval(heartbeat)
   server.stop()
   if (imessageModule) imessageModule.stopIMessage?.()
   if (assistantModule) assistantModule.stopAssistant?.()
