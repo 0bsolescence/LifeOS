@@ -164,7 +164,14 @@ export function checkHermesHealth(): HermesHealth {
   const checkedAt = new Date().toISOString();
   const home = hermesHome();
 
-  if (!existsSync(home)) {
+  // A bare home directory is not an install. Omarchy's own Hermes CLI
+  // (`omarchy-install-hermes-cli`) creates ~/.hermes/skills on every Omarchy
+  // box, and that alone reported the LifeOS sidecar as "down — gateway down"
+  // on every Linux perch (2026-09-04). Installed means the sidecar has left
+  // one of its own marks: gateway state, a start log, or its cron dir.
+  const sidecarMarks = ["gateway_state.json", "gateway-starts.log", "cron"];
+  const installed = existsSync(home) && sidecarMarks.some((m) => existsSync(join(home, m)));
+  if (!installed) {
     return {
       status: "absent",
       summary: "Hermes sidecar not installed",

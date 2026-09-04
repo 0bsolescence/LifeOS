@@ -1199,6 +1199,16 @@ async function main() {
     const elapsed = Date.now() - tickStart
     const sleepMs = Math.max(MIN_SLEEP_MS, Math.min(nextDueMs - elapsed, MAX_SLEEP_MS))
 
+    // Heartbeat. state.json used to be written only after a job ran, so any
+    // quiet stretch over two minutes read as "tick stale" on every menu bar
+    // (2026-09-04). One small write per loop pass, at most once a minute given
+    // MAX_SLEEP_MS, makes the file's age mean what the readers assume: how long
+    // since this loop last came round.
+    state.lastTick = Date.now()
+    await writeState(STATE_PATH, state).catch((err) =>
+      log("error", "Failed to persist heartbeat", { error: String(err) })
+    )
+
     if (!shuttingDown) {
       await Bun.sleep(sleepMs)
     }

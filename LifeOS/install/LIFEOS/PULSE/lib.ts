@@ -87,6 +87,8 @@ export interface JobState {
 }
 
 export interface DaemonState {
+  /** Written every run-loop pass (≤ MAX_SLEEP_MS apart); readers treat its age as loop liveness. */
+  lastTick?: number
   version: 1
   jobs: Record<string, JobState>
   startedAt: number

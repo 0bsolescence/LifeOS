@@ -143,7 +143,9 @@ function daemonBlock(): MenuBarPayload["daemon"] {
     if (!alive && fileAgeSec > 120) return { status: "stopped", label: "Stopped", uptimeSec: 0, failingJobs, jobCount }
     if (failingJobs > 0)
       return { status: "failing", label: `Failing — ${failingJobs} job${failingJobs === 1 ? "" : "s"}`, uptimeSec: 0, failingJobs, jobCount }
-    if (fileAgeSec > 120) return { status: "stale", label: "Running — tick stale", uptimeSec: 0, failingJobs, jobCount }
+    // Pulse heartbeats state.json every loop pass (MAX_SLEEP_MS = 60s), so 120s
+    // here means two consecutive passes were missed: a wedged loop, not a quiet one.
+    if (fileAgeSec > 120) return { status: "stale", label: "Running — loop stalled", uptimeSec: 0, failingJobs, jobCount }
     const uptimeSec = Math.max(0, Math.floor(Date.now() / 1000 - (st.startedAt || 0) / 1000))
     return { status: "running", label: `Running — ${fmtUptime(uptimeSec)}`, uptimeSec, failingJobs, jobCount }
   } catch {
@@ -245,6 +247,12 @@ async function buildPayload(): Promise<MenuBarPayload> {
     const rec = typeof conduit.todayRecordPublic === "function" ? conduit.todayRecordPublic() : null
     if (rec && typeof rec.creationMinutes === "number") {
       conduitMinutes = rec.creationMinutes
+    }
+    // A zero-minute day is not an event. A Conduit that is installed but dark
+    // (config present, nothing captured) must add no row — the same rule the
+    // Hermes block applies to an absent sidecar. Verified 2026-09-04: the row
+    // was showing "Conduit 0m creation today" on every LifeOS bar.
+    if (rec && typeof rec.creationMinutes === "number" && rec.creationMinutes > 0) {
       // Stable "today" stamp — a daily summary row, not a discrete event, so it must not
       // re-badge on every poll (it would never clear once seen).
       feed.push({
