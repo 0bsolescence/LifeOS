@@ -30,20 +30,46 @@ function sh(cmd: string): string {
 const toml = join(HOME, ".claude/LIFEOS/PULSE/PULSE.toml");
 if (existsSync(toml)) {
   const raw = readFileSync(toml, "utf-8");
+  // Section lookup is line-anchored and bounded to the section body. A bare
+  // indexOf matched the string "[syslog]" inside a COMMENT on line 57, then read
+  // the next `enabled = true` from an unrelated section and reported the syslog
+  // listener enabled while it was in fact off and nothing was bound to 5514
+  // (found 2026-09-05). Appearance is not existence.
+  const sectionBody = (section: string): string | null => {
+    const esc = section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m0 = raw.match(new RegExp(`^\\[${esc}\\]\\s*$`, "m"));
+    if (!m0 || m0.index === undefined) return null;
+    return raw.slice(m0.index + m0[0].length).split(/^\[/m)[0];
+  };
   const flag = (section: string): boolean | null => {
-    const i = raw.indexOf(`[${section}]`);
-    if (i < 0) return null;
-    const m = raw.slice(i).match(/enabled\s*=\s*(true|false)/);
+    const body = sectionBody(section);
+    if (body === null) return null;
+    const m = body.match(/^enabled\s*=\s*(true|false)/m);
     return m ? m[1] === "true" : null;
   };
   const syslog = flag("syslog");
   add("PULSE syslog disabled", syslog === false,
     `[syslog] enabled = ${syslog}`,
     "set enabled = false in ~/.claude/LIFEOS/PULSE/PULSE.toml — it binds UDP 5514 on 0.0.0.0");
+
+  // RULED 2026-09-05 by the principal: public ntfy egress is SANCTIONED, not a
+  // regression. The lane is load-bearing (DawnFlightNotify, MorningBrief.sh, the
+  // unit-failure notifier) and carries notification metadata only, never brief
+  // content, per MORNING_BRIEF's metadata-only rule. The check now asserts the
+  // sanctioned SHAPE rather than demanding the feature be off: a private,
+  // unguessable topic on the expected host. A topic that turns guessable, or a
+  // server swapped for something unexpected, still fails.
   const ntfy = flag("notifications.ntfy");
-  add("PULSE ntfy disabled", ntfy === false,
-    `[notifications.ntfy] enabled = ${ntfy}`,
-    "set enabled = false — it egresses to the public ntfy.sh service");
+  const nbody = sectionBody("notifications.ntfy") ?? "";
+  const topic = (nbody.match(/^\s*topic\s*=\s*"([^"]*)"/m) || [])[1] ?? "";
+  const server = (nbody.match(/^\s*server\s*=\s*"([^"]*)"/m) || [])[1] ?? "";
+  const shapeOk = ntfy !== true
+    || (server === "ntfy.sh" && topic.length >= 16 && /[0-9a-f]{12,}/.test(topic));
+  add("PULSE ntfy sanctioned (metadata-only)", shapeOk,
+    ntfy === true
+      ? `enabled, server = ${server || "(unset)"}, topic ${topic.length} chars — sanctioned 2026-09-05`
+      : `[notifications.ntfy] enabled = ${ntfy}`,
+    "public ntfy is ruled acceptable; keep server = ntfy.sh and the topic long and random — never put brief content on this lane");
 } else {
   add("PULSE.toml present", false, `missing at ${toml}`);
 }
