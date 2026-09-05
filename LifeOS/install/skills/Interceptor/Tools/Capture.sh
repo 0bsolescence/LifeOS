@@ -186,7 +186,12 @@ fi
 mkdir -p "$(dirname "$OUT")"
 
 # Build common flag arrays.
-SS_FLAGS=(--context "$CTX" --save --out "$OUT")
+# Stock interceptor >= 0.24 rejects --out on `screenshot` (--out belongs to `save`/`net`);
+# --save writes to the CLI cwd and reports the real path as "filePath". So: no --out,
+# capture from a scratch cwd, and let resolve_saved() lift filePath into $OUT — the
+# same reconciliation the --pixel path always needed. (2026-09-05, first stock-pkg install.)
+SS_FLAGS=(--context "$CTX" --save)
+CAPTURE_CWD="${TMPDIR:-/tmp}"
 [ "$FULL" -eq 1 ] && SS_FLAGS+=(--full)
 
 # --- helpers ---
@@ -273,11 +278,11 @@ heal_bridge() {
 }
 
 dom_capture() {
-    interceptor screenshot "${SS_FLAGS[@]}" 2>&1
+    (cd "$CAPTURE_CWD" && interceptor screenshot "${SS_FLAGS[@]}" 2>&1)
 }
 
 pixel_capture() {
-    interceptor screenshot "${SS_FLAGS[@]}" --pixel 2>&1
+    (cd "$CAPTURE_CWD" && interceptor screenshot "${SS_FLAGS[@]}" --pixel 2>&1)
 }
 
 # --- 5/6/7. capture with bounded recovery. DOM-first, then a single classified
