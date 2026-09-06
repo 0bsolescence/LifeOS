@@ -2,7 +2,7 @@
  * Menu Bar aggregator module — the single payload behind the rich Pulse menu bar.
  *
  * Serves ONE route:
- *   GET /api/menubar → { generatedAt, daemon, counts, feed[] }
+ *   GET /api/menubar → { generatedAt, daemon, counts, hermes, jobs[], feed[] }
  *
  * It stitches a cross-subsystem view for the native Swift menu bar app so the dropdown
  * can show per-subsystem counts + a chronological activity feed WITHOUT the Swift app
@@ -18,6 +18,7 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { hermesHealth } from "./scheduled.ts"
+import { loadConfig, type Job } from "../lib.ts"
 
 const MODULE_NAME = "menubar"
 const state = { running: false, startedAt: null as Date | null }
@@ -25,7 +26,8 @@ const state = { running: false, startedAt: null as Date | null }
 const CLAUDE = join(homedir(), ".claude")
 const LIFEOS = join(CLAUDE, "LIFEOS")
 const OBS = join(LIFEOS, "MEMORY", "OBSERVABILITY")
-const STATE_DIR = join(LIFEOS, "PULSE", "state")
+const PULSE_DIR = join(LIFEOS, "PULSE")
+const STATE_DIR = join(PULSE_DIR, "state")
 const WORK_JSON = join(LIFEOS, "MEMORY", "STATE", "work.json")
 
 // ---------- types ----------
@@ -46,11 +48,28 @@ interface HermesBlock {
   channels: string
 }
 
+/**
+ * One scheduled job as a menu bar renders it. The schedule ships twice on
+ * purpose: `schedule` is the cron expression an operator recognises, and
+ * `scheduleHuman` is what a menu row shows, translated HERE so every client
+ * says the same thing instead of each reimplementing cron.
+ */
+interface JobRow {
+  name: string
+  schedule: string
+  scheduleHuman: string
+  enabled: boolean
+  consecutiveFailures: number
+  lastResult: string
+  lastRunMs: number
+}
+
 interface MenuBarPayload {
   generatedAt: string
   daemon: { status: string; label: string; uptimeSec: number; failingJobs: number; jobCount: number }
   counts: { amber: number; conduitMinutes: number; memory: number; memoryPending: number; work: number }
   hermes: HermesBlock
+  jobs: JobRow[]
   feed: FeedItem[]
 }
 
@@ -151,6 +170,85 @@ function daemonBlock(): MenuBarPayload["daemon"] {
   } catch {
     return { status: "stopped", label: "Stopped", uptimeSec: 0, failingJobs: 0, jobCount: 0 }
   }
+}
+
+// ---------- jobs (PULSE.toml + PULSE.user.toml, merged) ----------
+
+/**
+ * Cron to the phrasing a menu row shows. Only the two shapes PULSE.toml
+ * actually uses are translated; anything else is returned verbatim, which is
+ * honest rather than a wrong guess at a schedule someone depends on.
+ */
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+function cronToHuman(expr: string): string {
+  const parts = String(expr || "").trim().split(/\s+/)
+  if (parts.length !== 5) return expr
+  const [minute, hour, dom, month, dow] = parts
+  if (hour === "*" && dom === "*" && month === "*" && dow === "*") {
+    if (minute === "*") return "every minute"
+    if (minute.startsWith("*/")) return `every ${minute.slice(2)}min`
+  }
+  if (dom === "*" && month === "*" && !hour.includes("*") && !minute.includes("*")) {
+    const h = Number(hour)
+    const m = Number(minute)
+    if (Number.isFinite(h) && Number.isFinite(m)) {
+      const ampm = h >= 12 ? "pm" : "am"
+      const displayH = h === 0 ? 12 : h > 12 ? h - 12 : h
+      const at = m === 0 ? `${displayH}${ampm}` : `${displayH}:${String(m).padStart(2, "0")}${ampm}`
+      if (dow === "*") return `daily at ${at}`
+      // A single weekday is the only weekly shape PULSE.toml uses. A list or a
+      // range stays verbatim rather than being paraphrased into something the
+      // scheduler does not actually do.
+      const day = DAY_NAMES[Number(dow)]
+      if (day && /^[0-6]$/.test(dow)) return `${day}s at ${at}`
+    }
+  }
+  return expr
+}
+
+/**
+ * The job list is parsed on demand, not per request: a menu bar polls this
+ * endpoint every few seconds, and the two TOML files behind it change when a
+ * human edits one. A read that throws keeps serving the last good list rather
+ * than emptying the section — a config that failed to parse this second is not
+ * evidence that the jobs are gone.
+ */
+let jobsCache: { at: number; jobs: Job[] } = { at: 0, jobs: [] }
+
+async function configJobs(): Promise<Job[]> {
+  if (jobsCache.at > 0 && Date.now() - jobsCache.at < 60_000) return jobsCache.jobs
+  try {
+    const cfg = await loadConfig(PULSE_DIR)
+    jobsCache = { at: Date.now(), jobs: cfg.jobs }
+  } catch {
+    /* last good list stands */
+  }
+  return jobsCache.jobs
+}
+
+/** Bounded so a pathological config can never blow up a menu bar's payload. */
+const MAX_JOBS = 60
+
+async function jobsBlock(): Promise<JobRow[]> {
+  let states: Record<string, any> = {}
+  try {
+    states = JSON.parse(readFileSync(join(STATE_DIR, "state.json"), "utf8")).jobs || {}
+  } catch {
+    /* no state yet — schedules still render, run history just reads empty */
+  }
+  return (await configJobs()).slice(0, MAX_JOBS).map((j) => {
+    const s = states[j.name] || {}
+    return {
+      name: String(j.name || ""),
+      schedule: String(j.schedule || ""),
+      scheduleHuman: cronToHuman(String(j.schedule || "")),
+      enabled: !!j.enabled,
+      consecutiveFailures: Number(s.consecutiveFailures ?? 0),
+      lastResult: String(s.lastResult ?? ""),
+      lastRunMs: Number(s.lastRun ?? 0),
+    }
+  })
 }
 
 // ---------- Synapse / amber ledger (cloud, best-effort, cached) ----------
@@ -377,6 +475,7 @@ async function buildPayload(): Promise<MenuBarPayload> {
     daemon,
     counts: { amber: amberCount, conduitMinutes, memory: memoryToday, memoryPending, work: work.count },
     hermes,
+    jobs: await jobsBlock(),
     feed: feed.slice(0, 20),
   }
 }
@@ -408,6 +507,7 @@ export async function handleRequest(_req: Request, pathname: string): Promise<Re
         daemon: daemonBlock(),
         counts: { amber: 0, conduitMinutes: 0, memory: 0, memoryPending: 0, work: 0 },
         hermes: HERMES_ABSENT,
+        jobs: [],
         feed: [],
         error: String(err),
       })
