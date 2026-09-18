@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.1.2
+ * @version 1.2.0
  * MemoryTurnStart.hook.ts — the ONE UserPromptSubmit memory hook.
  *
  * Consolidation (2026-07-11, hooks BPE pass): merges the three per-prompt
@@ -88,16 +88,18 @@ async function readStdin(): Promise<string> {
   });
 }
 
-if (isSubagent()) process.exit(0);
-
 (async () => {
   let sessionId = "unknown";
   let prompt = "";
+  let input: any = null;
   try {
-    const input = JSON.parse(await readStdin());
+    input = JSON.parse(await readStdin());
     sessionId = input.session_id || "unknown";
     prompt = typeof input.prompt === "string" ? input.prompt : "";
   } catch {}
+  // v2.0.0 detector: the stdin agent_id/agent_type is the documented subagent
+  // signal; the env fork marker is set in main sessions too (INC-20260918).
+  if (isSubagent(input)) process.exit(0);
 
   // Turn boundary for the ⚙️ SYSTEM surface. It lives here because this is the
   // ONE UserPromptSubmit composer, so it needs no new settings.json entry — and

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 2.1.0
+ * @version 2.2.0
  * MemoryReviewFire — Stop hook that owns the WHOLE memory-review cadence.
  *
  * Consolidation (2026-07-11, thinking-system BPE strip): the old design split
@@ -42,7 +42,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { spawn } from "node:child_process";
 import { dirname, join, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
-import { isSubagentContext as isSubagent } from './lib/subagent';
+import { isSubagentContext as isSubagent, type SubagentIdentity } from './lib/subagent';
 
 const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
 const STATE_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/review-state.json");
@@ -201,17 +201,18 @@ function logFire(payload: Record<string, unknown>): void {
  * of guessing via globally-newest-mtime, which grabs a concurrent session's
  * transcript whenever two sessions overlap (public issue #1495, @christauff).
  */
-function readHookInput(): { sessionId: string | null; transcriptPath: string | null } {
+function readHookInput(): { sessionId: string | null; transcriptPath: string | null; identity: SubagentIdentity | null } {
   try {
     const raw = readFileSync(0, "utf8");
-    if (!raw.trim()) return { sessionId: null, transcriptPath: null };
+    if (!raw.trim()) return { sessionId: null, transcriptPath: null, identity: null };
     const j = JSON.parse(raw);
     return {
       sessionId: typeof j.session_id === "string" ? j.session_id : null,
       transcriptPath: typeof j.transcript_path === "string" ? j.transcript_path : null,
+      identity: { agent_id: j.agent_id, agent_type: j.agent_type },
     };
   } catch {
-    return { sessionId: null, transcriptPath: null };
+    return { sessionId: null, transcriptPath: null, identity: null };
   }
 }
 
@@ -240,9 +241,9 @@ function spawnReviewer(turnsReviewed: number, transcriptPath: string | null): { 
 
 function main(): void {
   try {
-    if (isSubagent()) process.exit(0);
-
-    const { sessionId, transcriptPath } = readHookInput();
+    const { sessionId, transcriptPath, identity } = readHookInput();
+    // v2.0.0 detector: decide on the stdin agent fields, never the env fork marker (INC-20260918).
+    if (isSubagent(identity)) process.exit(0);
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
     const config = loadConfig();

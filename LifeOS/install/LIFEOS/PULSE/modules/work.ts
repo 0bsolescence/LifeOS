@@ -124,6 +124,13 @@ function issueSource(labels: string[]): "pai-sync" | "auto-native" | "auto-sweep
   return "manual";
 }
 
+// Column-name synonyms, keyed by the punctuation-free form of the alias target.
+const COLUMN_SYNONYMS: Record<string, string[]> = {
+  inprogress: ["In Progress", "In-Progress", "Doing"],
+  inreview: ["Review", "In Review", "In-Review", "Needs Human"],
+  complete: ["Done", "Complete"],
+};
+
 function deriveColumn(issue: { labels: string[]; state: string }, columns: string[]): string {
   if (issue.state === "CLOSED") {
     return columns.includes("Complete")
@@ -137,8 +144,16 @@ function deriveColumn(issue: { labels: string[]; state: string }, columns: strin
       const raw = label.slice("Status:".length).trim().toLowerCase();
       const aliased = LEGACY_STATUS_ALIASES[raw];
       const target = aliased ?? raw;
-      const hit = columns.find((c) => c.toLowerCase() === target.toLowerCase());
-      if (hit) return hit;
+      // 2026-09-15 fix: the alias table emits hyphenated names ("In-Progress",
+      // "In-Review", "Complete") while config.yaml columns are spelled with
+      // spaces ("In Progress", "Review", "Done"), so two lanes were unreachable.
+      // Compare on a punctuation-free key and accept documented synonyms.
+      const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const candidates = [target, ...(COLUMN_SYNONYMS[norm(target)] ?? [])];
+      for (const cand of candidates) {
+        const hit = columns.find((c) => norm(c) === norm(cand));
+        if (hit) return hit;
+      }
     }
   }
   // Default for open issues without a Status:* label.

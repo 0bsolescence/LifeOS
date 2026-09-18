@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.4.14
+ * @version 1.5.0
  * KittyEnvPersist.hook.ts - Kitty terminal env persistence + tab reset (SessionStart)
  *
  * PURPOSE:
@@ -20,21 +20,23 @@ import { isSubagentContext } from './lib/subagent';
 
 const paiDir = getLifeosDir();
 
-// Skip for subagents
-if (isSubagentContext()) process.exit(0);
-
 // Read session_id + source from stdin (SessionStart hook input)
 // source ∈ {"startup", "resume", "compact", "clear"}; absent on older CC versions.
 let sessionId = '';
 let source = '';
+let hookInput: any = null;
 try {
   const raw = readFileSync(0, 'utf-8');
   if (raw) {
-    const parsed = JSON.parse(raw);
-    sessionId = String(parsed.session_id || '');
-    source = String(parsed.source || '');
+    hookInput = JSON.parse(raw);
+    sessionId = String(hookInput.session_id || '');
+    source = String(hookInput.source || '');
   }
 } catch { /* best-effort */ }
+
+// Skip for subagents — decided on the stdin agent fields, never the env fork
+// marker, which main sessions carry too (INC-20260918).
+if (isSubagentContext(hookInput)) process.exit(0);
 
 // Persist Kitty environment for hooks that run later without terminal context
 const kittyListenOn = process.env.KITTY_LISTEN_ON;

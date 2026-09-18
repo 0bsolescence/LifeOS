@@ -203,6 +203,47 @@ for (const h of REQUIRED_REGISTRATIONS) {
   }
 }
 
+// CHECK 3c: main-session hook liveness — the surface hook heartbeats on every
+// primary-session prompt, so if prompts are being processed but the heartbeat
+// is stale, the per-turn hooks are exiting silently. CHECK 3b only fires when
+// curation is writing; with the reviewer never having fired it stayed quiet
+// for the four days nine hooks were muted by a false subagent detection
+// (INC-20260918). This check keys on prompts, which always exist.
+{
+  const HEARTBEAT_FILE = join(CLAUDE, "LIFEOS/MEMORY/STATE/delta-surface-heartbeat");
+  const PROMPTS_FILE = join(OBS_DIR, "prompt-processing.jsonl");
+  const STALE_MS = 24 * 60 * 60 * 1000;
+  try {
+    let lastPromptTs = 0;
+    let promptsSinceHeartbeat = 0;
+    const hbTs = existsSync(HEARTBEAT_FILE) ? Date.parse(readFileSync(HEARTBEAT_FILE, "utf-8").trim()) : 0;
+    if (existsSync(PROMPTS_FILE)) {
+      const tail = readFileSync(PROMPTS_FILE, "utf-8").trim().split("\n").slice(-400);
+      for (const l of tail) {
+        try {
+          const r = JSON.parse(l);
+          const t = Date.parse(r.timestamp ?? r.ts ?? "");
+          if (!Number.isFinite(t)) continue;
+          lastPromptTs = Math.max(lastPromptTs, t);
+          if (t > hbTs) promptsSinceHeartbeat++;
+        } catch { /* skip bad row */ }
+      }
+    }
+    if (lastPromptTs === 0) {
+      add("hook-liveness-no-prompts", "ok", "No prompt evidence yet; hook liveness not assessable.");
+    } else if (!hbTs || (lastPromptTs - hbTs > STALE_MS && promptsSinceHeartbeat > 0)) {
+      add("hook-liveness-dead", "warn",
+          `Prompts are being processed (${promptsSinceHeartbeat} since the last surface heartbeat) but MemoryDeltaSurface has not emitted in >24h — the per-turn hooks are exiting silently (subagent false positive? settings registration?).`,
+          { lastPrompt: new Date(lastPromptTs).toISOString(), heartbeat: hbTs ? new Date(hbTs).toISOString() : "never", promptsSinceHeartbeat });
+    } else {
+      add("hook-liveness-alive", "ok", "Per-turn hook heartbeat is current relative to processed prompts.",
+          { heartbeat: new Date(hbTs).toISOString(), promptsSinceHeartbeat });
+    }
+  } catch (err) {
+    add("hook-liveness-check-error", "warn", `Hook liveness check failed: ${(err as Error).message}`);
+  }
+}
+
 // CHECK 4: review-state.json exists and is readable
 let lastReviewAt: string | null = null;
 if (!existsSync(REVIEW_STATE)) {

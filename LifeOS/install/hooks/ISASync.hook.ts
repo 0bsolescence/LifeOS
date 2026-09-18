@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.5.0
+ * @version 1.6.0
  * ISASync.hook.ts — ISA → work.json sync via PostToolUse
  *
  * TRIGGER: PostToolUse (Write, Edit, MultiEdit, Read)
@@ -153,7 +153,7 @@ async function main(): Promise<string | null> {
   // without a phase edit. Per-session dedupe file; subagents never emit (their
   // ISA edits would strip-spam their own contexts, which helps nobody).
   let stripDelta: string | null = null;
-  if (input.session_id && fm.slug && !isSubagentContext()) {
+  if (input.session_id && fm.slug && !isSubagentContext(input)) {
     try {
       const stripDir = join(homedir(), '.claude/LIFEOS/MEMORY/STATE/ascent-strip');
       const stripFile = join(stripDir, `${String(input.session_id).replace(/[^\w-]/g, '')}.json`);

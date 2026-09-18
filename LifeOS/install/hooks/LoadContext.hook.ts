@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.6.31
+ * @version 1.7.0
  * LoadContext.hook.ts - Inject LifeOS dynamic context into Claude's Context (SessionStart)
  *
  * LifeOS v5.0 Context Architecture:
@@ -46,6 +46,7 @@ import { recordSessionStart } from './lib/notifications';
 import { loadWisdomFrames } from './lib/learning-readback';
 import { loadAdvisoryDigest } from './lib/advisory-readback';
 import { isSubagentContext } from './lib/subagent';
+import { readHookInput } from './lib/hook-io';
 import { isDesktopChannel, getNotificationChannel } from './lib/notification-channel';
 import { PHASE_TO_ASCENT } from '../LIFEOS/TOOLS/ascent';
 
@@ -462,8 +463,11 @@ async function checkActiveProgress(paiDir: string): Promise<string | null> {
 
 async function main() {
   try {
-    // Subagents don't need dynamic context injection
-    if (isSubagentContext()) {
+    // Subagents don't need dynamic context injection. Decided on the stdin
+    // agent_id/agent_type (the documented signal), never the env fork marker,
+    // which Claude Code 2.1.26x+ sets in main sessions too (INC-20260918).
+    const hookInput = await readHookInput();
+    if (isSubagentContext(hookInput as any)) {
       console.error('🤖 Subagent session - skipping context loading');
       process.exit(0);
     }

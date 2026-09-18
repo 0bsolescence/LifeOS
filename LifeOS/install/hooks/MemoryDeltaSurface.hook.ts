@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.0.11
+ * @version 1.1.0
  * MemoryDeltaSurface — UserPromptSubmit hook that makes the autonomic memory
  * loop VISIBLE in every response, Hermes-style.
  *
@@ -142,18 +142,50 @@ function stalestSegment(): string {
   }
 }
 
-/** Latest critical health row → loud 🩺 nag (unchanged from v1). */
-function criticalHealthLine(): string | null {
-  try {
-    if (!existsSync(HEALTH_LOG)) return null;
-    const lines = readFileSync(HEALTH_LOG, "utf8").trim().split("\n");
-    const last = JSON.parse(lines[lines.length - 1]);
-    if (last?.overall !== "critical") return null;
+/** How long a WARN must persist before it is surfaced. A transient warn during a
+ * reviewer run is noise; sixteen days of WARN that nobody saw (INC-20260918) is
+ * the failure this exists for. */
+export const WARN_SURFACE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** Latest critical health row → loud 🩺 nag. WARN rows nag too once the log has
+ * been continuously non-ok for WARN_SURFACE_AFTER_MS (v2.1.0). Exported and pure
+ * for the test; `nowMs` is injectable. */
+export function healthLineFromLog(logText: string, nowMs: number = Date.now()): string | null {
+  const lines = logText.trim().split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return null;
+  let last: any;
+  try { last = JSON.parse(lines[lines.length - 1]); } catch { return null; }
+  const fix = "Fix: bun ~/.claude/LIFEOS/TOOLS/MemoryHealthCheck.ts";
+  if (last?.overall === "critical") {
     const blockers = (last.findings ?? [])
       .filter((f: any) => f.severity === "critical")
       .map((f: any) => f.message)
       .slice(0, 3);
-    return `🩺 MEMORY HEALTH: CRITICAL — ${blockers.join(" · ") || `${last.counts?.critical ?? "?"} blocker(s)`}. Fix: bun ~/.claude/LIFEOS/TOOLS/MemoryHealthCheck.ts`;
+    return `🩺 MEMORY HEALTH: CRITICAL — ${blockers.join(" · ") || `${last.counts?.critical ?? "?"} blocker(s)`}. ${fix}`;
+  }
+  if (last?.overall !== "warn") return null;
+  // Walk back through the tail to find when the current non-ok stretch began.
+  let stretchStart = Date.parse(last.ts);
+  for (let i = lines.length - 2; i >= Math.max(0, lines.length - 2000); i--) {
+    let row: any;
+    try { row = JSON.parse(lines[i]); } catch { continue; }
+    if (!row?.ts) continue;
+    if (row.overall === "ok") break;
+    stretchStart = Math.min(stretchStart, Date.parse(row.ts));
+  }
+  if (!Number.isFinite(stretchStart) || nowMs - stretchStart < WARN_SURFACE_AFTER_MS) return null;
+  const days = Math.floor((nowMs - stretchStart) / (24 * 60 * 60 * 1000));
+  const top = (last.findings ?? [])
+    .filter((f: any) => f.severity === "warn")
+    .map((f: any) => f.message)
+    .slice(0, 2);
+  return `🩺 MEMORY HEALTH: WARN for ${days}d — ${top.join(" · ") || `${last.counts?.warn ?? "?"} warning(s)`}. ${fix}`;
+}
+
+function criticalHealthLine(): string | null {
+  try {
+    if (!existsSync(HEALTH_LOG)) return null;
+    return healthLineFromLog(readFileSync(HEALTH_LOG, "utf8"));
   } catch {
     return null;
   }
@@ -202,7 +234,7 @@ export function run(): string | null {
     if (healthLine) {
       out +=
         `<lifeos-memory-health>\n` +
-        `Memory subsystem health is CRITICAL. Surface this line VERBATIM in your response so it cannot be ignored:\n` +
+        `Memory subsystem health is not ok. Surface this line VERBATIM in your response so it cannot be ignored:\n` +
         `${healthLine}\n` +
         `</lifeos-memory-health>\n`;
     }

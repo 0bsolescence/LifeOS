@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.0.1
+ * @version 1.1.0
  * SystemChangeSurface.hook.ts — makes self-modification VISIBLE in the response.
  *
  * TRIGGER: PostToolUse (Write, Edit, MultiEdit) — composed inside
@@ -113,7 +113,7 @@ function writeLedger(path: string, ledger: Ledger): void {
 
 export function run(input: HookInput): string | null {
   try {
-    if (isSubagent()) return null;
+    if (isSubagent(input)) return null; // stdin agent fields, never the env fork marker (INC-20260918)
     const tool = input.tool_name ?? "";
     if (!WRITE_TOOLS.has(tool)) return null;
     const filePath = input.tool_input?.file_path;
