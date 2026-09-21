@@ -32,7 +32,7 @@ import { run as loadMemory } from "./LoadMemory.hook";
 import { run as deltaSurface } from "./MemoryDeltaSurface.hook";
 import { getRelevantContext } from "../LIFEOS/TOOLS/MemoryRetriever";
 import { clearLedger as clearSystemDelta } from "./SystemChangeSurface.hook";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
@@ -120,10 +120,28 @@ async function readStdin(): Promise<string> {
   // corpus, or trivial prompt) injects nothing.
   if (prompt.trim().length > 0) {
     try {
+      const startedAt = Date.now();
       const ground = getRelevantContext(prompt, { topK: 5, threshold: 0.20 });
       if (ground.markdownBlock) {
         process.stdout.write(`<lifeos-ground>\n${ground.markdownBlock}\n</lifeos-ground>\n`);
       }
+      // Retrieval evidence (caller-side, per the A4 ruling: tools stay pure
+      // readers). One row per retrieval into OBSERVABILITY/memory-retrievals.jsonl,
+      // the file MemoryHealthCheck reads; nothing from the prompt lands in it,
+      // only a hash, counts and timing. Absent since the file was first named
+      // (17 days of "retrieval-missing" WARN, fixed 2026-09-20).
+      try {
+        const row = {
+          ts: new Date().toISOString(),
+          query_hash: createHash("sha256").update(prompt).digest("hex").slice(0, 16),
+          returned_count: ground.results.length,
+          duration_ms: Date.now() - startedAt,
+          top_score: (() => { const s = (ground.results[0] as any)?.score; return typeof s === "number" && Number.isFinite(s) && s >= 0 ? s : undefined; })(),
+        };
+        const obs = pathResolve(homedir(), ".claude", "LIFEOS", "MEMORY", "OBSERVABILITY");
+        mkdirSync(obs, { recursive: true });
+        appendFileSync(pathResolve(obs, "memory-retrievals.jsonl"), JSON.stringify(row) + "\n");
+      } catch {}
     } catch (e) {
       process.stderr.write(`MemoryTurnStart ground error: ${(e as Error)?.message || String(e)}\n`);
     }

@@ -6,7 +6,7 @@
  *
  * The 30-second story this code implements:
  *
- *   {{DA_NAME}} has one memory system. Every item in it has a type — memory, idea,
+ *   Muninn has one memory system. Every item in it has a type — memory, idea,
  *   knowledge, or proposal. A background reviewer reads recent conversation
  *   and emits typed items. The system routes each item to the right place
  *   based on type. Memory items load into every prompt. Ideas and knowledge
@@ -838,9 +838,29 @@ export function add(item: TypedItem): AddResult {
   // broken or replaced by a real directory, the same lexical path would land
   // personal data inside the system tree — refuse instead. Realpath-based, so
   // a symlinked component cannot defeat it.
-  const boundary = assertInsideUserData(path);
-  if (!boundary.ok) {
-    return { ok: false, code: "EWRITE_FAILED", message: `memory write refused at the system/user boundary: ${boundary.reason}` };
+  //
+  // Queue writes are the one exception to checking `path`: the pending-proposal
+  // queue is a machine-local OBSERVABILITY file by contract (PENDING_PROPOSALS_PATH),
+  // so it never resolves into the private repo and never should. What must stay
+  // inside the repo for a proposal is its eventual TARGET, so that is what the
+  // boundary is asserted against (2026-09-20: every proposal enqueue had been
+  // refused on the queue file's own path, INC-20260919 producer half).
+  const resolveTargetFileForBoundary = (t: string): string => {
+    const trimmed = t.trim();
+    if (trimmed.startsWith("~/")) return pathJoin(homedir(), trimmed.slice(2));
+    if (trimmed.startsWith("/")) return trimmed;
+    return pathJoin(LIFEOS_DIR, trimmed);
+  };
+  const boundaryTarget = entry.write_mode === "queue"
+    ? (typeof (item as any).target_file === "string" && (item as any).target_file.trim().length > 0
+        ? resolveTargetFileForBoundary((item as any).target_file)
+        : null)
+    : path;
+  if (boundaryTarget !== null) {
+    const boundary = assertInsideUserData(boundaryTarget);
+    if (!boundary.ok) {
+      return { ok: false, code: "EWRITE_FAILED", message: `memory write refused at the system/user boundary: ${boundary.reason}` };
+    }
   }
 
   // Defense-in-depth: for direct writes (set-overwrite, append), the registry's

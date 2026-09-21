@@ -221,9 +221,34 @@ export function looksLikePersonalTranscript(absPath: string): boolean {
   return containsTranscriptArray(parsed, 3);
 }
 
-/** Canonical USER_DATA repo root — where all personal data physically lives. */
+/** Canonical USER_DATA root — the identity tree inside the private synced repo. */
 export function userDataRoot(): string {
   return join(homedir(), ".config", "LIFEOS", "USER");
+}
+
+/**
+ * The private synced repo that holds ALL personal data: `USER/` (identity),
+ * `MEMORY/{KNOWLEDGE,LEARNING,WORK}` (the shared memory zones, symlinked from
+ * `~/.claude/LIFEOS/MEMORY/`) and their siblings. It is the git toplevel that
+ * contains `userDataRoot()`; when no repo encloses it (a fresh install before
+ * `lifeos-sync` exists) the USER tree itself is the boundary, exactly as before.
+ *
+ * INC-20260919 / 2026-09-20: the boundary used to be `USER/` alone, so every
+ * knowledge, idea and proposal write from the memory reviewer resolved into
+ * `~/.config/LIFEOS/MEMORY/KNOWLEDGE/…` and was refused as "outside the repo"
+ * although it was inside the same private repo, two directories over. The
+ * reviewer then read as failed for every run that produced one of those items.
+ */
+export function privateRepoRoot(): string {
+  const user = realpathSync(userDataRoot());
+  let dir = user;
+  for (let i = 0; i < 3; i++) {
+    if (existsSync(join(dir, ".git"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return user;
 }
 
 /**
@@ -239,7 +264,7 @@ export function userDataRoot(): string {
 export function assertInsideUserData(absTarget: string): { ok: true } | { ok: false; reason: string } {
   let root: string;
   try {
-    root = realpathSync(userDataRoot());
+    root = privateRepoRoot();
   } catch (e: any) {
     return { ok: false, reason: `USER_DATA root unresolvable at ${userDataRoot()} (${e?.message ?? e}) — refusing personal-data write (fail-closed)` };
   }
@@ -262,6 +287,6 @@ export function assertInsideUserData(absTarget: string): { ok: true } | { ok: fa
   if (resolved === root || resolved.startsWith(root + sep)) return { ok: true };
   return {
     ok: false,
-    reason: `resolved target ${resolved} is outside the USER_DATA repo (${root}) — personal data must never land in the system tree (SystemUserBoundary.md)`,
+    reason: `resolved target ${resolved} is outside the private synced repo (${root}) — personal data must never land in the system tree (SystemUserBoundary.md)`,
   };
 }
