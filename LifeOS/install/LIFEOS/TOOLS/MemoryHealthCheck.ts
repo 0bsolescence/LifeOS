@@ -10,7 +10,7 @@
  *   - review-state.json missing or unreadable
  *   - reviewer subprocess never fired (count is 0 historically)
  *
- * Output: JSON to stdout. Exit 0 = healthy; exit 1 = at least one warning;
+ * Output: JSON to stdout (`--human`: one line per finding with its remedy). Exit 0 = healthy; exit 1 = at least one warning;
  * exit 2 = at least one CRITICAL (subsystem is structurally broken).
  *
  * Appends one row per invocation to MEMORY/OBSERVABILITY/memory-health.jsonl
@@ -440,7 +440,18 @@ try {
   // Preserve the CLI existing stdout, stderr, and health-derived exit semantics.
 }
 
-await Bun.write(Bun.stdout, JSON.stringify(report, null, 2) + "\n");
+// --human (2026-09-25, Daniel 09-24: "it only gives me the json output"): one line per
+// finding, severity first, then the remedy the 🩺 line would show. JSON stays the default so
+// MemoryHealthGate and the health log are untouched; exit code unchanged either way.
+if (process.argv.includes("--human")) {
+  const { fixForFinding } = await import("../../hooks/MemoryDeltaSurface.hook");
+  const lines = [`overall: ${overall}  (critical ${criticals.length} · warn ${warns.length} · ok ${oks.length})  ${report.ts}`];
+  for (const f of [...criticals, ...warns]) lines.push(`${f.severity.toUpperCase()}: ${f.id} — ${f.message}\n    ${fixForFinding(f.id)}`);
+  if (criticals.length + warns.length === 0) lines.push("no findings; nothing to do");
+  await Bun.write(Bun.stdout, lines.join("\n") + "\n");
+} else {
+  await Bun.write(Bun.stdout, JSON.stringify(report, null, 2) + "\n");
+}
 
 if (overall === "critical") process.exit(2);
 if (overall === "warn") process.exit(1);

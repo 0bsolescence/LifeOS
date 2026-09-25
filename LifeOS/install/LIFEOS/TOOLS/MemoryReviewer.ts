@@ -32,6 +32,7 @@
 
 import {
   appendFileSync,
+  unlinkSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -58,8 +59,17 @@ import {
 
 const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
 const HARNESS_PROJECTS_DIR = pathResolve(homedir(), ".claude", "projects");
-const RUNS_LOG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs.jsonl");
-const RUNS_DEBUG_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs");
+// LIFEOS_REVIEWER_OBS_DIR: tests point the run log, debug dir and lock at a temp root so a
+// self-test never writes into the live observability tree (staged rule 2026-09-20).
+const REVIEWER_OBS_DIR = process.env.LIFEOS_REVIEWER_OBS_DIR || pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY");
+const RUNS_LOG_PATH = pathResolve(REVIEWER_OBS_DIR, "reviewer-runs.jsonl");
+const RUN_LOCK_PATH = pathResolve(REVIEWER_OBS_DIR, "reviewer-runs/.run.lock");
+const RUN_LOCK_STALE_MS = 15 * 60 * 1000; // a run holds the lock while alive; a dead pid or 15 min frees it
+
+/** Terminal states a run row can carry (2026-09-25, weekend ISA F4). `started` is the
+ *  non-terminal marker written before inference so an interrupted run leaves evidence. */
+export type RunStatus = "started" | "completed" | "skipped" | "failed" | "timed-out" | "interrupted" | "skipped-overlap";
+const RUNS_DEBUG_DIR = pathResolve(REVIEWER_OBS_DIR, "reviewer-runs");
 const REVIEW_CONFIG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/CONFIG/memory-review.json");
 
 const DEFAULT_TURNS = 20;
@@ -603,6 +613,89 @@ function logRunSummary(row: Record<string, unknown>): void {
   } catch { /* best-effort */ }
 }
 
+// ── Run lock + terminal-row guarantee (2026-09-25; INC-20260919-reviewer-never-fires follow-up) ──
+// Two runs on record (2026-09-21T12-51-20-640Z, 2026-09-24T04-44-39-684Z) applied their memory and
+// knowledge writes and then died before dispatch.log and the run row were written: "ran, parsed,
+// applied, never logged". Whatever ends the process, the log must say so. Three parts:
+//   (a) a `started` row before inference, so an interrupted run is distinguishable from one that
+//       never started;
+//   (b) process-level handlers that write an `interrupted` / `failed` terminal row on SIGTERM,
+//       SIGHUP, SIGINT, uncaughtException and unhandledRejection, then exit;
+//   (c) a run lock so two concurrent reviewers cannot dispatch the same items twice; the second
+//       logs `skipped-overlap` and exits 0.
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
+}
+
+export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): { ok: true } | { ok: false; holder: { pid: number; runId: string; started: string } } {
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true });
+    if (existsSync(lockPath)) {
+      let holder: any = null;
+      try { holder = JSON.parse(readFileSync(lockPath, "utf8")); } catch { holder = null; }
+      const startedMs = holder?.started ? Date.parse(holder.started) : NaN;
+      const fresh = Number.isFinite(startedMs) && nowMs - startedMs < RUN_LOCK_STALE_MS;
+      const alive = typeof holder?.pid === "number" && holder.pid !== process.pid && pidAlive(holder.pid);
+      if (holder && fresh && alive) return { ok: false, holder };
+      // stale (dead pid or older than the window): take over
+    }
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() }), "utf8");
+    return { ok: true };
+  } catch {
+    return { ok: true }; // lock is best-effort; never block a run on a lock write failure
+  }
+}
+
+export function releaseRunLock(lockPath: string = RUN_LOCK_PATH): void {
+  try {
+    if (!existsSync(lockPath)) return;
+    const holder = JSON.parse(readFileSync(lockPath, "utf8"));
+    if (holder?.pid === process.pid) unlinkSync(lockPath);
+  } catch { /* best-effort */ }
+}
+
+let activeRun: { runId: string; transcript: string | null; exchanges: number; startedMs: number } | null = null;
+let terminalRowWritten = false;
+
+function writeTerminalRow(row: Record<string, unknown>): void {
+  if (terminalRowWritten) return;
+  terminalRowWritten = true;
+  logRunSummary({ ts: new Date().toISOString(), ...row });
+  releaseRunLock();
+}
+
+function interruptedRow(reason: string): Record<string, unknown> {
+  const a = activeRun;
+  return {
+    ok: false,
+    status: "interrupted",
+    runId: a?.runId ?? "unknown",
+    transcript: a?.transcript ?? null,
+    exchanges: a?.exchanges ?? 0,
+    inference_duration_ms: a ? Date.now() - a.startedMs : 0,
+    parse_ok: false,
+    error: reason,
+  };
+}
+
+let handlersInstalled = false;
+function installExitHandlers(): void {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
+    process.on(sig, () => { writeTerminalRow(interruptedRow(`interrupted: ${sig}`)); process.exit(130); });
+  }
+  process.on("uncaughtException", (e: any) => {
+    writeTerminalRow({ ...interruptedRow(`failed: uncaught ${e?.name ?? "Error"}: ${e?.message ?? String(e)}`), status: "failed", stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (e: any) => {
+    writeTerminalRow({ ...interruptedRow(`failed: unhandled rejection: ${e?.message ?? String(e)}`), status: "failed", stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    process.exit(1);
+  });
+}
+
 function writeRunDebug(runId: string, files: Record<string, string>): void {
   try {
     const dir = pathJoin(RUNS_DEBUG_DIR, runId);
@@ -636,27 +729,51 @@ export interface ReviewResult {
   skipped?: boolean;
   dispatch_summary?: DispatchSummary;
   error?: string;
+  /** Terminal status (2026-09-25). Older rows lack it; CortexHealth derives one from ok/error. */
+  status?: RunStatus;
 }
 
 export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
   const runId = tsSlug();
   const turns = opts.turns ?? DEFAULT_TURNS;
+  terminalRowWritten = false;
+  installExitHandlers();
 
+  // 0. One reviewer at a time: overlapping runs would dispatch the same items twice.
+  const lock = acquireRunLock(runId);
+  if (!lock.ok) {
+    const result: ReviewResult = { ok: true, runId, transcript: null, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped-overlap", error: `skipped: reviewer ${lock.holder.runId} (pid ${lock.holder.pid}) is still running since ${lock.holder.started}` };
+    logRunSummary({ ts: new Date().toISOString(), ...result });
+    terminalRowWritten = true;
+    return result;
+  }
+  try {
+    return await reviewLocked(runId, turns, opts);
+  } finally {
+    releaseRunLock();
+  }
+}
+
+async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): Promise<ReviewResult> {
   // 1. Locate transcript
   const transcript = opts.input ?? findMostRecentTranscript();
   if (!transcript) {
-    const result: ReviewResult = { ok: true, runId, transcript: null, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, error: "skipped: no transcript available" };
-    logRunSummary({ ts: new Date().toISOString(), ...result });
+    const result: ReviewResult = { ok: true, runId, transcript: null, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped", error: "skipped: no transcript available" };
+    writeTerminalRow(result as any);
     return result;
   }
 
   // 2. Extract exchanges
   const exchanges = extractRecentExchanges(transcript, turns);
   if (exchanges.length === 0) {
-    const result: ReviewResult = { ok: true, runId, transcript, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, error: "skipped: no exchanges extracted (empty or just-cleared transcript)" };
-    logRunSummary({ ts: new Date().toISOString(), ...result });
+    const result: ReviewResult = { ok: true, runId, transcript, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped", error: "skipped: no exchanges extracted (empty or just-cleared transcript)" };
+    writeTerminalRow(result as any);
     return result;
   }
+
+  // 2b. Started row: from here on, a missing terminal row means the process was ended, not that it never ran.
+  activeRun = { runId, transcript, exchanges: exchanges.length, startedMs: Date.now() };
+  logRunSummary({ ts: new Date().toISOString(), status: "started", runId, transcript, exchanges: exchanges.length, pid: process.pid });
 
   // 3. Build prompt — inject CURRENT memory state so the reviewer curates
   //    against reality (the op:"set" path REPLACES, so it must see what's there).
@@ -689,8 +806,9 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
     });
     inferenceDuration = Date.now() - startedAt;
     if (!result.success) {
-      const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, error: `inference failed: ${result.error}` };
-      logRunSummary({ ts: new Date().toISOString(), ...failed });
+      const timedOut = /time ?out|timed out|ETIMEDOUT/i.test(String(result.error));
+      const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, status: timedOut ? "timed-out" : "failed", error: `inference failed: ${result.error}` };
+      writeTerminalRow(failed as any);
       return failed;
     }
     inferenceOutput = result.output;
@@ -724,14 +842,22 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
     writeRunDebug(runId, {
       "parse-error.txt": stripPrivateContent(`${parsed.error}\n\nRaw:\n${parsed.raw}`),
     });
-    const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, error: `parse failed: ${parsed.error}` };
-    logRunSummary({ ts: new Date().toISOString(), ...failed });
+    const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, status: "failed", error: `parse failed: ${parsed.error}` };
+    writeTerminalRow(failed as any);
     return failed;
   }
   writeRunDebug(runId, { "response.parsed.json": JSON.stringify(parsed.output, null, 2) });
 
-  // 6. Dispatch
-  const { summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun });
+  // 6. Dispatch — a throw here used to end the process with the writes applied and no row.
+  let summary: DispatchSummary, results: AddResult[];
+  try {
+    ({ summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun }));
+  } catch (e: any) {
+    const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: true, status: "failed", error: `dispatch threw: ${e?.name ?? "Error"}: ${e?.message ?? String(e)}` };
+    writeRunDebug(runId, { "dispatch.log": `THREW before completing dispatch: ${String(e?.stack ?? e)}` });
+    writeTerminalRow({ ...(failed as any), stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    return failed;
+  }
   writeRunDebug(runId, {
     "dispatch.log": [
       `Items: ${summary.total} (succeeded=${summary.succeeded} failed=${summary.failed} skipped_guard=${summary.skipped_guard})`,
@@ -756,9 +882,10 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
     inference_duration_ms: inferenceDuration,
     parse_ok: true,
     dispatch_summary: summary,
+    status: writeErrors.length === 0 ? "completed" : "failed",
     ...(writeErrors.length === 0 ? {} : { error: writeErrors.join("; ") }),
   };
-  logRunSummary({ ts: new Date().toISOString(), ...result });
+  writeTerminalRow(result as any);
   return result;
 }
 

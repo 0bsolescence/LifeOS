@@ -150,18 +150,38 @@ export const WARN_SURFACE_AFTER_MS = 24 * 60 * 60 * 1000;
 /** Latest critical health row → loud 🩺 nag. WARN rows nag too once the log has
  * been continuously non-ok for WARN_SURFACE_AFTER_MS (v2.1.0). Exported and pure
  * for the test; `nowMs` is injectable. */
+/** Per-finding remedy strings (2026-09-25). Each is an action a person can take, never the diagnostic itself. */
+export function fixForFinding(id: string): string {
+  const table: Array<[RegExp, string]> = [
+    [/^reviewer-latest-timed-out$/, "Fix: the inference step exceeded its timeout; the next completed reviewer run supersedes it. If it recurs, read that run's dir under OBSERVABILITY/reviewer-runs/ before touching DEFAULT_TIMEOUT_MS."],
+    [/^reviewer-latest-interrupted$/, "Fix: the reviewer process was ended after it started (signal or parent teardown); the next fire supersedes it. Read the started row's pid and journalctl around its ts to name what ended it."],
+    [/^reviewer-latest-never-started$/, "Fix: a run directory has no rows (pre-2026-09-25 reviewer, or died before inference). Read the dir, then append a reconstructed row with what the evidence shows."],
+    [/^reviewer-latest-failed$/, "Fix: read the row's error and the run dir's dispatch.log; a typed refusal names the boundary, 'dispatch threw' carries the stack."],
+    [/^reviewer-latest-parse-failed$/, "Fix: read parse-error.txt in the run dir; the model output failed validation twice. No rerun unless it repeats."],
+    [/^reviewer-evidence-invalid$/, "Fix: the latest row does not match the success/skip schema; compare it with CortexHealth.validReviewerSuccess and repair the row or the writer."],
+    [/^index-/, "Fix: rebuild the knowledge index (bun ~/.claude/LIFEOS/TOOLS/Cortex.ts index), then re-read health."],
+    [/hook/, "Fix: restore the hook file or its settings.json registration from the fork's patches branch, then re-read health."],
+    [/^state-corrupt$/, "Fix: repair or remove OBSERVABILITY/review-state.json (the fire hook recreates it)."],
+    [/-memory-missing$/, "Fix: restore the *_MEMORY.md file from the USER repo (lifeos-sync)."],
+    [/^(review-stale|no-historical-runs|no-runs-dir|state-missing)$/, "Fix: nothing to run by hand; the reviewer fires after 8 turns in one session. If it stays stale for days, read reviewer-fires.jsonl."],
+  ];
+  for (const [re, fix] of table) if (re.test(id)) return fix;
+  return "Fix: bun ~/.claude/LIFEOS/TOOLS/MemoryHealthCheck.ts --human, then act on the named finding.";
+}
+
 export function healthLineFromLog(logText: string, nowMs: number = Date.now()): string | null {
   const lines = logText.trim().split("\n").filter((l) => l.trim().length > 0);
   if (lines.length === 0) return null;
   let last: any;
   try { last = JSON.parse(lines[lines.length - 1]); } catch { return null; }
-  const fix = "Fix: bun ~/.claude/LIFEOS/TOOLS/MemoryHealthCheck.ts";
+  // 2026-09-25: the line names a REMEDY per finding, not the diagnostic that produced it
+  // (Daniel, 09-24: the old "Fix: bun …MemoryHealthCheck.ts" only re-ran the check).
+  const remedy = (f: any): string => fixForFinding(String(f?.id ?? ""));
   if (last?.overall === "critical") {
-    const blockers = (last.findings ?? [])
-      .filter((f: any) => f.severity === "critical")
-      .map((f: any) => f.message)
-      .slice(0, 3);
-    return `🩺 MEMORY HEALTH: CRITICAL — ${blockers.join(" · ") || `${last.counts?.critical ?? "?"} blocker(s)`}. ${fix}`;
+    const crit = (last.findings ?? []).filter((f: any) => f.severity === "critical").slice(0, 3);
+    const blockers = crit.map((f: any) => f.message);
+    const fixes = Array.from(new Set(crit.map(remedy)));
+    return `🩺 MEMORY HEALTH: CRITICAL — ${blockers.join(" · ") || `${last.counts?.critical ?? "?"} blocker(s)`}. ${fixes.join(" ") || fixForFinding("")}`;
   }
   if (last?.overall !== "warn") return null;
   // Walk back through the tail to find when the current non-ok stretch began.
@@ -179,7 +199,7 @@ export function healthLineFromLog(logText: string, nowMs: number = Date.now()): 
     .filter((f: any) => f.severity === "warn")
     .map((f: any) => f.message)
     .slice(0, 2);
-  return `🩺 MEMORY HEALTH: WARN for ${days}d — ${top.join(" · ") || `${last.counts?.warn ?? "?"} warning(s)`}. ${fix}`;
+  return `🩺 MEMORY HEALTH: WARN for ${days}d — ${top.join(" · ") || `${last.counts?.warn ?? "?"} warning(s)`}. ${fixForFinding(String((last.findings ?? []).find((f: any) => f.severity === "warn")?.id ?? ""))}`;
 }
 
 function criticalHealthLine(): string | null {

@@ -39,9 +39,13 @@ const PROJECTS_DIR = path.join(CLAUDE_DIR, "projects", CWD_SLUG);
 const LEARNING_DIR = path.join(CLAUDE_DIR, "LIFEOS", "MEMORY", "LEARNING");
 
 // Patterns indicating learning moments in conversations
+// 2026-09-25 (dawn brief 09-22 § harvester noise; 266 "corrections" in September): the bare
+// "actually," / "wait," matched anywhere in a user turn, so a long dispatch containing either
+// word was filed as a correction. They now count only when they OPEN a turn (a real
+// interjection), and a turn that is a pasted document or a raven/reviewer prompt is skipped
+// below (isPromptShapedTurn). The six explicit shapes are unchanged.
 const CORRECTION_PATTERNS = [
-  /actually,?\s+/i,
-  /wait,?\s+/i,
+  /^\s*(?:actually|wait),?\s+/i,
   /no,?\s+i meant/i,
   /let me clarify/i,
   /that's not (quite )?right/i,
@@ -246,9 +250,30 @@ function matchesPatterns(text: string, patterns: RegExp[]): { matches: boolean; 
 // Learning Extraction
 // ============================================================================
 
+/** A user turn that is a document or a machine-written prompt rather than a reply to the
+ *  assistant. Any of: pasted-content markup, a raven/teammate brief, the reviewer's memory-state
+ *  block, a cross-session message, or a long multi-section text (headings + length). */
+export function isPromptShapedTurn(text: string): boolean {
+  if (/<pasted_content\b|<teammate-message\b|<cross-session-message\b|── CURRENT MEMORY STATE|You are a raven dispatched/i.test(text)) return true;
+  const headings = (text.match(/^#{1,4}\s+\S/gm) || []).length;
+  if (headings >= 3 && text.length > 1500) return true;
+  return false;
+}
+
 function harvestLearnings(sessionPath: string): HarvestedLearning[] {
   const learnings: HarvestedLearning[] = [];
   const sessionId = path.basename(sessionPath, '.jsonl');
+  // 2026-09-25: a raven's or the reviewer's transcript is instructions, not the principal's
+  // conversation; nothing in it is a correction OF the assistant BY the principal.
+  if (/[\/]subagents[\/]|[\/]agent-[^\/]+\.jsonl$/.test(sessionPath)) return learnings;
+  // A raven spawned by the Agent tool gets a top-level transcript whose first entries carry
+  // {type:"agent-setting", agentSetting:…}; the principal's own sessions never do.
+  {
+    const head = fs.readFileSync(sessionPath, 'utf-8').split('\n', 12);
+    for (const line of head) {
+      try { const e = JSON.parse(line); if (e?.type === 'agent-setting' && e?.agentSetting) return learnings; } catch { /* not json */ }
+    }
+  }
 
   const content = fs.readFileSync(sessionPath, 'utf-8');
   const lines = content.split('\n').filter(line => line.trim());
@@ -260,15 +285,18 @@ function harvestLearnings(sessionPath: string): HarvestedLearning[] {
       const entry = JSON.parse(line) as ProjectsEntry;
 
       if (!entry.message?.content) continue;
+      if ((entry as any).isSidechain === true || typeof (entry as any).agent_id === 'string') continue;
 
       const timestamp = entry.timestamp || new Date().toISOString();
       const textContent = ingestTranscriptText(sessionId, timestamp, extractTextContent(entry.message.content));
       if (!textContent || textContent.length < 20) continue;
 
-      // Check for corrections (user messages)
+      // Check for corrections (user messages). A pasted document, a dispatch, a raven brief or
+      // the memory reviewer's own prompt is an instruction, not a correction of the assistant;
+      // a capture with no preceding assistant turn (empty context) is a prompt by construction.
       if (entry.type === 'user') {
         const { matches, matchedPattern } = matchesPatterns(textContent, CORRECTION_PATTERNS);
-        if (matches) {
+        if (matches && !isPromptShapedTurn(textContent) && previousContext.length > 0) {
           learnings.push({
             sessionId,
             timestamp,
@@ -522,6 +550,9 @@ function writeLearning(learning: HarvestedLearning): string {
 // CLI
 // ============================================================================
 
+// 2026-09-25: the CLI runs only when this file is the entry point. Importing the module for
+// its exports (tests, other tools) used to execute a full harvest as a side effect.
+if (import.meta.main) {
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
@@ -635,4 +666,5 @@ if (values["dry-run"]) {
     console.log(`   ✅ ${path.basename(result)}`);
   }
   console.log(`\n✅ Harvested ${totalLearnings} learning(s) to MEMORY/LEARNING/`);
+}
 }

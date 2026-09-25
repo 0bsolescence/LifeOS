@@ -6,7 +6,7 @@ import { loadCanonicalRecords } from "./Cortex";
 export type Severity = "ok" | "warn" | "critical";
 export interface HealthFinding { id: string; severity: Severity; message: string; evidence?: any; }
 export interface ReviewerEvidence {
-  status: "ok" | "skipped" | "failed" | "parse-failed" | "timed-out" | "missing" | "invalid";
+  status: "ok" | "skipped" | "failed" | "parse-failed" | "timed-out" | "interrupted" | "running" | "never-started" | "missing" | "invalid";
   ts?: string; runId?: string; evidence: string; priorSuccesses?: number; error?: string;
 }
 export interface RetrievalEvidence { status: "ok" | "missing" | "invalid"; ts?: string; queryHash?: string; returnedCount?: number; durationMs?: number; evidence: string; malformedLines?: number[]; }
@@ -56,7 +56,7 @@ function validDispatchSummary(value: unknown): boolean {
 }
 
 function validReviewerSuccess(row: unknown): row is Record<string, unknown> {
-  if (!isPlainObject(row) || !hasExactKeys(row, ["ts", "ok", "runId", "transcript", "exchanges", "inference_duration_ms", "parse_ok", "dispatch_summary"])) return false;
+  if (!isPlainObject(row) || !hasExactKeys(row, ["ts", "ok", "runId", "transcript", "exchanges", "inference_duration_ms", "parse_ok", "dispatch_summary", "status", "reconstructed", "note"], ["ts", "ok", "runId", "transcript", "exchanges", "inference_duration_ms", "parse_ok", "dispatch_summary"])) return false;
   return row.ok === true && row.parse_ok === true && typeof row.runId === "string" && row.runId.length > 0 &&
     typeof row.ts === "string" && Number.isFinite(Date.parse(row.ts)) && typeof row.transcript === "string" && row.transcript.length > 0 &&
     nonNegativeInteger(row.exchanges) && nonNegativeFinite(row.inference_duration_ms) && validDispatchSummary(row.dispatch_summary);
@@ -66,7 +66,7 @@ function validReviewerSuccess(row: unknown): row is Record<string, unknown> {
 // curate). Fail-closed: anything claiming skipped that doesn't match this exact
 // shape stays "invalid" (critical), so a broken extractor can't dress up as a skip.
 function validReviewerSkip(row: unknown): row is Record<string, unknown> {
-  if (!isPlainObject(row) || !hasExactKeys(row, ["ts", "ok", "runId", "transcript", "exchanges", "inference_duration_ms", "parse_ok", "skipped", "error"], ["ts", "ok", "runId", "exchanges", "inference_duration_ms", "parse_ok", "skipped"])) return false;
+  if (!isPlainObject(row) || !hasExactKeys(row, ["ts", "ok", "runId", "transcript", "exchanges", "inference_duration_ms", "parse_ok", "skipped", "error", "status", "reconstructed", "note"], ["ts", "ok", "runId", "exchanges", "inference_duration_ms", "parse_ok", "skipped"])) return false;
   return row.ok === true && row.parse_ok === true && row.skipped === true && row.exchanges === 0 &&
     typeof row.runId === "string" && row.runId.length > 0 && typeof row.ts === "string" && Number.isFinite(Date.parse(row.ts)) &&
     (row.transcript === null || row.transcript === undefined || typeof row.transcript === "string") &&
@@ -84,7 +84,8 @@ export function assessCortexEvidence(input: CortexEvidence): CortexAssessment {
   const thresholds = input.thresholds ?? DEFAULT_CORTEX_THRESHOLDS;
   const add = (id: string, severity: Severity, message: string, evidence?: any) => findings.push({ id, severity, message, ...(evidence === undefined ? {} : { evidence }) });
   if (!input.reviewer) add("reviewer-evidence-missing", "warn", "No reviewer evidence supplied.");
-  else if (["failed", "parse-failed", "timed-out", "invalid"].includes(input.reviewer.status)) add(input.reviewer.status === "invalid" ? "reviewer-evidence-invalid" : `reviewer-latest-${input.reviewer.status}`, "critical", `Latest reviewer run is ${input.reviewer.status}.`, input.reviewer);
+  else if (["failed", "parse-failed", "timed-out", "interrupted", "never-started", "invalid"].includes(input.reviewer.status)) add(input.reviewer.status === "invalid" ? "reviewer-evidence-invalid" : `reviewer-latest-${input.reviewer.status}`, "critical", `Latest reviewer run is ${input.reviewer.status}.`, input.reviewer);
+  else if (input.reviewer.status === "running") add("reviewer-running", "ok", "A reviewer run is in progress (started row, inside the grace window).", input.reviewer);
   else if (input.reviewer.status === "missing") add("reviewer-evidence-missing", "warn", "No latest reviewer evidence is available.", { ...input.reviewer, staleThresholdMs: thresholds.reviewerStaleMs });
   else if (!input.reviewer.ts || !Number.isFinite(Date.parse(input.reviewer.ts))) add("reviewer-evidence-invalid", "critical", "Reviewer success lacks a valid timestamp.", input.reviewer);
   else { const ageMs = input.nowMs - Date.parse(input.reviewer.ts); if (ageMs < 0) add("reviewer-future", "warn", "Reviewer timestamp is in the future and cannot prove freshness.", { ...input.reviewer, ageMs }); else if (ageMs > thresholds.reviewerStaleMs) add("reviewer-stale", "warn", `Latest reviewer evidence exceeds ${thresholds.reviewerStaleMs}ms freshness window.`, { ...input.reviewer, ageMs, thresholdMs: thresholds.reviewerStaleMs }); }
@@ -115,27 +116,43 @@ function runMs(runId?: string): number {
 function reviewerEvidence(obs: string, nowMs: number, thresholds: CortexThresholds): ReviewerEvidence {
   const log = join(obs, "reviewer-runs.jsonl");
   const parsed = readJsonl(log);
-  const latest = parsed.rows.at(-1);
   if (parsed.malformedLines.length) return { status: "parse-failed", evidence: log, error: `malformed JSONL lines: ${parsed.malformedLines.join(",")}` };
+  // 2026-09-25: rows are ordered by their own timestamp, not file position, because a
+  // reconciliation may append a `reconstructed` row for an old run; `started` rows are
+  // non-terminal markers and never count as the latest terminal evidence.
+  const rowMs = (r: any) => (r?.ts ? Date.parse(r.ts) : runMs(r?.runId));
+  const ordered = parsed.rows.filter((r) => Number.isFinite(rowMs(r))).sort((a, b) => rowMs(a) - rowMs(b));
+  const terminal = ordered.filter((r) => r.status !== "started");
+  const latest = terminal.at(-1);
+  const latestRowMs = rowMs(latest);
   const runsDir = join(obs, "reviewer-runs");
   const dirs = existsSync(runsDir) ? readdirSync(runsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort() : [];
   const latestDir = dirs.at(-1);
   const latestDirMs = runMs(latestDir);
-  const latestRowMs = latest?.ts ? Date.parse(latest.ts) : runMs(latest?.runId);
   if (latestDir && Number.isFinite(latestDirMs) && (!Number.isFinite(latestRowMs) || latestDirMs > latestRowMs)) {
+    // A run directory newer than every terminal row: the run is either still going,
+    // was ended before it could write its row (interrupted), or never reached the
+    // started marker (an older reviewer, or a spawn that died before inference).
     const path = join(runsDir, latestDir);
-    if (existsSync(join(path, "parse-error.txt"))) return { status: "parse-failed", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: join(path, "parse-error.txt"), priorSuccesses: parsed.rows.filter((r) => r.ok === true).length };
-    if (nowMs - latestDirMs > thresholds.reviewerRunGraceMs) return { status: "timed-out", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, error: `no terminal reviewer row within ${thresholds.reviewerRunGraceMs}ms`, priorSuccesses: parsed.rows.filter((r) => r.ok === true).length };
+    const prior = terminal.filter((r) => r.ok === true).length;
+    const started = ordered.find((r) => r.status === "started" && r.runId === latestDir);
+    if (existsSync(join(path, "parse-error.txt"))) return { status: "parse-failed", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: join(path, "parse-error.txt"), priorSuccesses: prior };
+    if (nowMs - latestDirMs <= thresholds.reviewerRunGraceMs) return { status: "running", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, priorSuccesses: prior };
+    if (started) return { status: "interrupted", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, error: `started (pid ${started.pid ?? "?"}) and left no terminal row within ${thresholds.reviewerRunGraceMs}ms — the process was ended, not timed out`, priorSuccesses: prior };
+    return { status: "never-started", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, error: `run directory exists with no started row and no terminal row within ${thresholds.reviewerRunGraceMs}ms (pre-2026-09-25 reviewer, or died before inference)`, priorSuccesses: prior };
   }
   if (!latest) return { status: "missing", evidence: `${log} and ${runsDir}` };
   const error = String(latest.error ?? "");
   if (latest.skipped === true) {
     const status: ReviewerEvidence["status"] = validReviewerSkip(latest) ? "skipped" : "invalid";
-    return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: parsed.rows.slice(0, -1).filter((r) => r.ok === true && r.skipped !== true).length };
+    return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: terminal.slice(0, -1).filter((r) => r.ok === true && r.skipped !== true).length };
   }
   const validSuccess = validReviewerSuccess(latest);
-  const status: ReviewerEvidence["status"] = latest.ok === false || latest.parse_ok === false ? (/timeout/i.test(error) ? "timed-out" : latest.parse_ok === false ? "parse-failed" : "failed") : validSuccess ? "ok" : "invalid";
-  return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: parsed.rows.slice(0, -1).filter((r) => r.ok === true).length };
+  const explicit = typeof latest.status === "string" ? latest.status : "";
+  const status: ReviewerEvidence["status"] = latest.ok === false || latest.parse_ok === false
+    ? (explicit === "interrupted" ? "interrupted" : explicit === "timed-out" || /timeout|timed out/i.test(error) ? "timed-out" : latest.parse_ok === false && !/dispatch threw/.test(error) && explicit !== "failed" ? "parse-failed" : "failed")
+    : validSuccess ? "ok" : "invalid";
+  return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: terminal.slice(0, -1).filter((r) => r.ok === true).length };
 }
 
 function observabilityEvidence(obs: string): CortexEvidence["observability"] {

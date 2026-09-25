@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.0.5
+ * @version 1.1.0
  * PreToolGuard.hook.ts — the ONE PreToolUse blocking-guard dispatcher.
  *
  * Consolidation (2026-07-11, security-hook unification): merges the three
@@ -53,6 +53,7 @@ import { check as communicationSkillGuard } from "./CommunicationSkillGuard.hook
 import { check as egressClassGuard } from "./EgressClassGuard.hook";
 import { check as publicPushGate } from "./PublicPushGate.hook";
 import { check as voiceEgressGuard } from "./VoiceEgressGuard.hook";
+import { check as killTargetGuard } from "./KillTargetGuard.hook";
 
 type BlockResult = { block: true; message: string } | null;
 type GuardCheck = (input: any) => BlockResult;
@@ -108,6 +109,9 @@ function main(): never {
       : tool === "Bash"
         ? [
             ["PlutilExtractGuard", plutilExtractGuard],
+            // 2026-09-25 (INC-20260920-reaper-probe-session-kill): a kill target is a
+            // launch handle, never a name, a search result, or a process group.
+            ["KillTargetGuard", killTargetGuard],
             // 2026-08-14 scheduled-task voice leak: headless sessions' skill
             // workflows curl the VoiceServer directly. No terminal, no voice.
             ["VoiceEgressGuard", voiceEgressGuard],
