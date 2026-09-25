@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.1.0
+ * @version 2.0.0
  * KillTargetGuard.hook.ts — a kill target is a launch handle, never a name.
  *
  * INC-20260920-reaper-probe-session-kill: a probe on tuf selected its target
@@ -11,28 +11,38 @@
  *
  * RULE (OPERATIONAL_RULES § Verification, applied 2026-09-25): no Bash command
  * from any session — main or subagent — signals a pid, pgid or session it did
- * not itself create and hold. Refused at this one choke point:
- *   - `pkill …` and `killall …` (name-selected targets)
- *   - `kill …` whose target text contains `pgrep`, `pidof`, `ps …|grep`, or
- *     any command substitution / backtick feeding the target
- *   - `pgrep|pidof|ps … | xargs kill` and `… | while read … kill`
- *   - `kill -<sig> -<N>` / `kill -- -<N>` / `kill -<sig> -$VAR`: a process-group
- *     or `-1` (everything) target. A group id cannot be verified as one this
- *     session created; signal the pid you launched instead.
+ * not itself create and hold. The command is parsed, not grepped: heredocs are
+ * stripped (quote-aware), quotes are resolved, the command is split into simple
+ * commands, every `$(…)`/backtick group is walked as the command it is, and the
+ * command word is found past assignments, redirections, keywords and wrappers
+ * (sudo, env, nohup, exec, xargs, watch, nice, ionice, setsid, timeout N,
+ * command, builtin, eval, ssh host). Refused:
+ *   - `pkill`, `killall` in command position, with or without a path prefix
+ *   - a `kill` target containing a `$(…)` or backtick substitution
+ *   - a `kill` target of `0`, `-1` or any `-<N>` / `-$VAR`: a process group
+ *   - a `kill $VAR` target when the same command runs a process search
+ *     (pgrep, pidof, ps, lsof, fuser) anywhere: `T=$(pgrep x); kill $T`
+ *   - `… | xargs kill` when the command runs a process search
  * Allowed, untouched:
- *   - `kill <literal pid>`, `kill $PID`, `kill $!`, `kill %1`, `kill -TERM 12345`
+ *   - `kill <literal pid>`, `kill $PID` with no search, `kill $!`, `kill %1`
  *   - `kill -0 …` in any form (a liveness probe delivers no signal)
- *   - `systemctl … kill`, `tmux kill-*`, `docker kill`, `adb … kill-server`,
- *     `gradlew --stop`, `emulator … -kill`: unit/handle-addressed, not pid guesses
- *   - text inside quotes (prose, a grep pattern, a commit message, a JS program) and
- *     heredoc bodies: data, not a command this call runs. The payload of `bash -c`,
- *     `sh -c`, `eval`, `su -c`, `ssh host '…'` IS scanned as a command.
- *   Known limit: a program in another language that spawns a name-killer itself
- *   (bun -e, python -c) is not parsed; the guard closes the incident's shape at the shell layer.
+ *   - `kill` as an argument: `systemctl kill`, `tmux kill-*`, `docker kill`,
+ *     `adb … kill-server`, `emu kill`; `command -v pkill`, `echo pkill`
+ *   - quoted text: single-quoted, and double-quoted without `$`/backtick, is a
+ *     data word (it keeps its word, so a quoted COMMAND word still counts). A
+ *     double-quoted `$(…)` is expanded by the shell and is scanned. The payload
+ *     of `bash -c`, `sh -c`, `su -c`, `eval`, `ssh host '…'` is scanned as a program.
+ *   - heredoc bodies are data, except a body fed to a shell (scanned whole) and
+ *     the `$(…)` substitutions of an unquoted-tag body (they run at write time).
+ *   Known limits: a program in another language that spawns a name-killer itself
+ *   (bun -e, python -c), a command word held in a variable (`$K -f x`), and
+ *   ANSI-C escapes spelling a name (`$'pk\151ll'`) are not resolved; the guard
+ *   closes the incident's shape at the shell layer.
  * Escape hatch: none inside a Claude session. Destructive process probes run
  * in a disposable VM or an `unshare -Urpf --mount-proc` namespace, proven
  * first (recovery ISA C1 containment). Fail-OPEN on internal anomaly, matching
- * the dispatcher's isolation contract; a refusal is exit 2 with the reason.
+ * the dispatcher's isolation contract, except input nested past the parser's
+ * depth bound, which is refused; a refusal is exit 2 with the reason.
  *
  * WIRING: PreToolGuard.hook.ts (PreToolUse:Bash) via the exported check().
  */
@@ -43,91 +53,299 @@ type BlockResult = { block: true; message: string } | null;
 
 export interface KillVerdict { refuse: boolean; reason: string; match?: string }
 
-// Strip heredoc bodies: the text between `<<TAG` and the line holding TAG is
-// data being written, not a command this call runs. A probe SCRIPT may be
-// written; running it is a separate Bash call that the guard sees on its own.
-function stripHeredocs(cmd: string): string {
-  const lines = cmd.split("\n");
-  const out: string[] = [];
-  let tag: string | null = null;
-  for (const line of lines) {
-    if (tag !== null) {
-      if (line.trim() === tag) tag = null;
+// ── Lexical helpers. Every scanner is a single forward pass; nesting is bounded
+// by MAX_DEPTH so hostile input cannot turn a parse into a stack overflow.
+const MAX_DEPTH = 16;
+class TooDeep extends Error {}
+
+function endOfSingle(s: string, i: number): number {
+  const j = s.indexOf("'", i);
+  return j < 0 ? s.length : j;
+}
+function endOfAnsi(s: string, i: number): number {
+  for (let k = i; k < s.length; k++) {
+    if (s[k] === "\\") { k++; continue; }
+    if (s[k] === "'") return k;
+  }
+  return s.length;
+}
+function endOfBacktick(s: string, i: number): number {
+  for (let k = i; k < s.length; k++) {
+    if (s[k] === "\\") { k++; continue; }
+    if (s[k] === "`") return k;
+  }
+  return s.length;
+}
+function endOfDouble(s: string, i: number, d = 0): number {
+  if (d > MAX_DEPTH) throw new TooDeep();
+  for (let k = i; k < s.length; k++) {
+    const c = s[k];
+    if (c === "\\") { k++; continue; }
+    if (c === '"') return k;
+    if (c === "$" && s[k + 1] === "(") { k = endOfGroup(s, k + 2, d + 1); continue; }
+    if (c === "`") { k = endOfBacktick(s, k + 1); continue; }
+  }
+  return s.length;
+}
+// i is the index just after the opening `(`; returns the index of the matching `)`.
+function endOfGroup(s: string, i: number, d = 0): number {
+  if (d > MAX_DEPTH) throw new TooDeep();
+  let depth = 1;
+  for (let k = i; k < s.length; k++) {
+    const c = s[k];
+    if (c === "\\") { k++; continue; }
+    if (c === "'") { k = endOfSingle(s, k + 1); continue; }
+    if (c === '"') { k = endOfDouble(s, k + 1, d + 1); continue; }
+    if (c === "`") { k = endOfBacktick(s, k + 1); continue; }
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return k;
+  }
+  return s.length;
+}
+const commentStart = (s: string, i: number) => i === 0 || /[\s;&|(]/.test(s[i - 1]);
+
+// ── Command-word walker: skips assignments, redirections, shell keywords and
+// wrappers that execute their argument (with the wrapper's own options), and
+// returns the command that actually runs. `command -v X` / `builtin -v` are lookups.
+const KEYWORDS = new Set(["!", "{", "}", "if", "then", "do", "else", "elif", "while", "until", "coproc"]);
+const WRAPPERS: Record<string, string> = {
+  // wrapper → single-letter options that take a separate argument
+  sudo: "ugphCDrtUT", doas: "uC", env: "uCS", nohup: "", exec: "a", xargs: "InPLsdEa",
+  watch: "nd", nice: "n", ionice: "cnp", setsid: "", timeout: "sk", command: "", builtin: "",
+  eval: "", time: "fo", stdbuf: "ioe", ssh: "bcDEeFIiJLlmOoPpQRSWw",
+};
+const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
+const REDIR = /^\d*(&?>>?|<>?|>&|<&|>\|)/;
+const base = (w: string) => { const x = w.replace(/\\/g, ""); return x.slice(x.lastIndexOf("/") + 1); };
+
+interface Walk { cmd: string; args: string[]; remote: boolean; viaXargs: boolean }
+function walk(words: string[]): Walk {
+  let i = 0, remote = false, viaXargs = false;
+  while (i < words.length) {
+    const w = words[i];
+    if (KEYWORDS.has(w) || ASSIGN.test(w)) { i++; continue; }
+    if (REDIR.test(w)) { i += /^\d*[<>&|]+$/.test(w) ? 2 : 1; continue; }
+    const b = base(w);
+    if (Object.prototype.hasOwnProperty.call(WRAPPERS, b)) {
+      i++;
+      if ((b === "command" || b === "builtin") && /^-[A-Za-z]*[vV]/.test(words[i] ?? "")) return { cmd: `${b} -v`, args: words.slice(i + 1), remote, viaXargs };
+      const takesArg = WRAPPERS[b];
+      while (i < words.length && words[i].startsWith("-") && words[i] !== "-") {
+        const o = words[i++];
+        if (o === "--") break;
+        if (o.length === 2 && takesArg.includes(o[1])) i++;
+      }
+      if (b === "env") while (i < words.length && ASSIGN.test(words[i])) i++;
+      if (b === "timeout") i++; // the duration
+      if (b === "ssh") { i++; remote = true; } // the host; the rest is the remote command
+      if (b === "eval") remote = true;
+      if (b === "xargs") viaXargs = true;
       continue;
     }
-    const m = line.match(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/);
-    if (m) tag = m[1];
-    out.push(line);
+    return { cmd: b, args: words.slice(i + 1), remote, viaXargs };
   }
-  return out.join("\n");
+  return { cmd: "", args: [], remote, viaXargs };
+}
+const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish", "su"]);
+let payloadMemo: { prefix: string; v: boolean } = { prefix: "", v: false };
+function isPayloadCtx(prefix: string): boolean {
+  // The prefix is capped at 256 chars, so a long segment asks the same question repeatedly.
+  if (prefix === payloadMemo.prefix) return payloadMemo.v;
+  const v = isPayloadCtxUncached(prefix);
+  payloadMemo = { prefix, v };
+  return v;
+}
+function isPayloadCtxUncached(prefix: string): boolean {
+  const words = prefix.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return false;
+  const w = walk(words);
+  return SHELLS.has(w.cmd) || w.remote;
 }
 
-// Command position only: start of line, after a separator, or after a wrapper that
-// executes its argument (sudo, env, nohup, timeout N, xargs, exec, watch, ssh host).
-const NAME_KILLERS = /(^|[\s;&|(`{]|\b(?:sudo|env|nohup|exec|xargs|watch|ssh\s+\S+|timeout\s+\S+)\s+)(pkill|killall)\b/m;
-
-// Text inside ordinary quotes is data (a commit message, a grep pattern, a JS
-// program, prose) — unless the quote is the payload of `bash -c`, `sh -c`,
-// `eval`, `ssh host '…'` or `su -c`, where the quoted text IS a command and is scanned
-// as one. Everything else in quotes is dropped before matching.
-function commandPayloads(cmd: string): string[] {
+// ── Heredocs (top level). A `<<TAG` outside quotes, not a here-string (`<<<`) and
+// not inside `$((…))`/`((…))`, starts a heredoc. Its body is data, except: fed to a
+// shell (`bash <<EOF`, `cat <<EOF | sh`) it is scanned as commands, and with an
+// unquoted tag its `$(…)`/backtick substitutions run at write time and are scanned.
+function lineIsShellFed(line: string): boolean {
+  return line.split(/[|;&(]/).some((piece) => isPayloadCtx(piece));
+}
+function substitutions(body: string): string[] {
   const out: string[] = [];
-  const re = /\b(?:bash|sh|zsh|dash|ksh|su|ssh(?:\s+\S+)+?)\s+(?:[^\s'"]+\s+)*?(?:-c|--command)?\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")/g;
-  for (const m of cmd.matchAll(re)) out.push(m[1] ?? m[2] ?? "");
-  const ev = /\beval\s+(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|(\S[^\n;]*))/g;
-  for (const m of cmd.matchAll(ev)) out.push(m[1] ?? m[2] ?? m[3] ?? "");
-  return out.filter((x) => x.length > 0);
+  for (let k = 0; k < body.length; k++) {
+    const c = body[k];
+    if (c === "\\") { k++; continue; }
+    if (c === "$" && body[k + 1] === "(") { const j = endOfGroup(body, k + 2); out.push(body.slice(k, j + 1)); k = j; continue; }
+    if (c === "`") { const j = endOfBacktick(body, k + 1); out.push(body.slice(k, j + 1)); k = j; }
+  }
+  return out;
+}
+export function stripHeredocs(s: string): string {
+  const out: string[] = [];
+  let pending: { tag: string; quoted: boolean }[] = [];
+  let lineStart = 0, last = 0, i = 0;
+  const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    if (c === "\\") { i += 2; continue; }
+    if (c === "'") { i = endOfSingle(s, i + 1) + 1; continue; }
+    if (c === "$" && s[i + 1] === "'") { i = endOfAnsi(s, i + 2) + 1; continue; }
+    if (c === '"') { i = endOfDouble(s, i + 1) + 1; continue; }
+    if (c === "`") { i = endOfBacktick(s, i + 1) + 1; continue; }
+    if (c === "$" && s[i + 1] === "(") { i = endOfGroup(s, i + 2) + 1; continue; }
+    if (c === "(" && s[i + 1] === "(") { i = endOfGroup(s, i + 1) + 1; continue; } // (( arithmetic ))
+    if (c === "#" && commentStart(s, i)) { const j = s.indexOf("\n", i); i = j < 0 ? n : j; continue; }
+    if (c === "<" && s[i + 1] === "<") {
+      if (s[i + 2] === "<") { i += 3; continue; } // here-string: the next word is data, the next line is not
+      const m = /^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([A-Za-z0-9_.-]+))/.exec(s.slice(i, i + 128));
+      if (m) { pending.push({ tag: m[1] ?? m[2] ?? m[3], quoted: m[3] === undefined || m[0].includes("\\") }); i += m[0].length; continue; }
+      i += 2; continue;
+    }
+    if (c === "\n") {
+      if (pending.length) {
+        const shellFed = lineIsShellFed(s.slice(lineStart, i));
+        out.push(s.slice(last, i + 1));
+        let pos = i + 1;
+        for (const h of pending) {
+          const body: string[] = [];
+          while (pos < n) {
+            const nl = s.indexOf("\n", pos);
+            const line = s.slice(pos, nl < 0 ? n : nl);
+            pos = nl < 0 ? n : nl + 1;
+            if (line.trim() === h.tag) break;
+            body.push(line);
+          }
+          const text = body.join("\n");
+          if (shellFed) out.push(text + "\n");
+          else if (!h.quoted) { const subs = substitutions(text); if (subs.length) out.push(": " + subs.join(" ") + "\n"); }
+        }
+        pending = [];
+        last = pos; i = pos; lineStart = pos;
+        continue;
+      }
+      lineStart = i + 1;
+    }
+    i++;
+  }
+  out.push(s.slice(last));
+  return out.join("");
 }
 
-function stripQuotes(cmd: string): string {
-  return cmd.replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""');
+// ── Quote handling → "executable text". Quoted text keeps its WORD (so `'pkill'`
+// in command position is still pkill) but loses its metacharacters (so a commit
+// message's `; pkill` never becomes a segment). `$(…)`, backticks and `$VAR`
+// inside double quotes are kept, because the shell expands them. The quoted
+// payload of `bash -c`, `sh -c`, `su -c`, `eval`, `ssh host …` is a program and
+// is emitted as its own lines.
+const neutral = (x: string) => x.replace(/[\s;&|()<>'"#`$\\]/g, "_");
+function neutralizeDouble(content: string): string {
+  let r = "";
+  for (let k = 0; k < content.length; k++) {
+    const c = content[k];
+    if (c === "\\") { r += "__"; k++; continue; }
+    if (c === "$" && content[k + 1] === "(") { const j = endOfGroup(content, k + 2); r += content.slice(k, j + 1); k = j; continue; }
+    if (c === "`") { const j = endOfBacktick(content, k + 1); r += content.slice(k, j + 1); k = j; continue; }
+    if (c === "$" && content[k + 1] === "{") { const j = content.indexOf("}", k); const e = j < 0 ? content.length - 1 : j; r += content.slice(k, e + 1).replace(/\s/g, "_"); k = e; continue; }
+    r += /[\s;&|()<>'"#]/.test(c) ? "_" : c;
+  }
+  return r;
 }
-// A kill invocation: `kill` as a command word (not `tmux kill-session`, not
-// `docker kill`, not `systemctl kill`, not `-kill`). Captures its argument text.
-const KILL_CMD = /(^|[\s;&|(`{\x22\x27])kill\b(?!-)([^\n;&|]*)/g;
-const SUBSTITUTION = /\$\(|`|\bpgrep\b|\bpidof\b|\bps\b/;
-const PIPED_KILL = /\b(pgrep|pidof|ps|lsof|fuser)\b[^\n|]*\|[^\n]*\b(xargs\s+(?:-[^\s]+\s+)*kill|kill\b|while\b[^\n]*\bkill\b)/;
-
-function signalIsZero(args: string): boolean {
-  return /(^|\s)(-0|-s\s*0|-n\s*0|-SIG0)(\s|$)/.test(args);
+function execText(s: string, depth: number): string {
+  if (depth > MAX_DEPTH) throw new TooDeep();
+  const out: string[] = [];
+  let seg = "";
+  const push = (x: string) => { out.push(x); if (seg.length < 256) seg += x; };
+  const n = s.length;
+  for (let i = 0; i < n;) {
+    const c = s[i];
+    if (c === "\\") { push(s.slice(i, i + 2)); i += 2; continue; }
+    if (c === "#" && commentStart(s, i)) { const j = s.indexOf("\n", i); i = j < 0 ? n : j; continue; }
+    if (c === "'" || (c === "$" && s[i + 1] === "'")) {
+      const st = c === "'" ? i + 1 : i + 2;
+      const j = c === "'" ? endOfSingle(s, st) : endOfAnsi(s, st);
+      const content = s.slice(st, j);
+      if (isPayloadCtx(seg)) out.push("\n", execText(content, depth + 1), "\n");
+      else push(neutral(content));
+      i = j + 1; continue;
+    }
+    if (c === '"') {
+      const j = endOfDouble(s, i + 1, depth);
+      const content = s.slice(i + 1, j);
+      if (isPayloadCtx(seg)) out.push("\n", execText(content, depth + 1), "\n");
+      else push(/[$`]/.test(content) ? neutralizeDouble(content) : neutral(content));
+      i = j + 1; continue;
+    }
+    if (c === "$" && s[i + 1] === "(") { const j = endOfGroup(s, i + 2, depth); push(s.slice(i, j + 1)); i = j + 1; continue; }
+    if (c === "`") { const j = endOfBacktick(s, i + 1); push(s.slice(i, j + 1)); i = j + 1; continue; }
+    if (";&|\n()".includes(c)) { out.push(c); seg = ""; i++; continue; }
+    push(c); i++;
+  }
+  return out.join("");
 }
 
-function groupTarget(args: string): string | null {
-  // `-- -123`, `-9 -123`, `-TERM -$PG`, `-9 -1`, `-9 -$(...)`
-  const stripped = args.replace(/^\s+/, "");
-  const m = stripped.match(/(?:^|\s)(?:--\s+)?-(\d+|\$[A-Za-z_{][^\s]*|\$\([^)]*\))(?=\s|$)/g);
-  if (!m) return null;
-  // The first `-9`/`-TERM` is the signal; a NEGATIVE numeric/variable token
-  // after a signal or after `--` is a group. Detect the shape "-<sig> -<target>"
-  // or "-- -<target>" explicitly.
-  const shape = stripped.match(/(?:^|\s)(?:-(?:\d+|[A-Z]+|s\s+\w+|n\s+\d+)\s+|--\s+)-(\d+|\$[A-Za-z_{][^\s]*|\$\([^)]*\))(?=\s|$)/);
-  return shape ? shape[0].trim() : null;
+// ── Segmenting: split executable text into simple commands, walk each, and
+// recurse into every `$(…)` / backtick group (each is a command that runs).
+interface Acc { nameKill: string | null; kills: { args: string[]; viaXargs: boolean; text: string }[]; search: boolean }
+const NAME_KILLERS = new Set(["pkill", "killall", "killall5"]);
+const SEARCHES = new Set(["pgrep", "pidof", "ps", "lsof", "fuser"]);
+
+function analyze(raw: string, depth: number, acc: Acc): void {
+  if (depth > MAX_DEPTH) throw new TooDeep();
+  const t = execText(raw, depth);
+  const groups: string[] = [];
+  let words: string[] = [], cur = "";
+  const flush = () => { if (cur) words.push(cur); cur = ""; };
+  const end = () => {
+    flush();
+    if (words.length === 0) return;
+    const w = walk(words);
+    if (NAME_KILLERS.has(w.cmd) && !acc.nameKill) acc.nameKill = w.cmd;
+    if (SEARCHES.has(w.cmd)) acc.search = true;
+    if (w.cmd === "kill") acc.kills.push({ args: w.args, viaXargs: w.viaXargs, text: ["kill", ...w.args].join(" ").slice(0, 80) });
+    words = [];
+  };
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === "\\") { cur += t.slice(i, i + 2); i++; continue; }
+    if (c === "$" && t[i + 1] === "(") { const j = endOfGroup(t, i + 2, depth); cur += t.slice(i, j + 1); groups.push(t.slice(i + 2, j)); i = j; continue; }
+    if (c === "`") { const j = endOfBacktick(t, i + 1); cur += t.slice(i, j + 1); groups.push(t.slice(i + 1, j)); i = j; continue; }
+    if (";&|\n()".includes(c)) { end(); continue; }
+    if (c === " " || c === "\t" || c === "\r") { flush(); continue; }
+    cur += c;
+  }
+  end();
+  for (const g of groups) analyze(g, depth + 1, acc);
+}
+
+function judgeKill(k: { args: string[]; viaXargs: boolean; text: string }, search: boolean): KillVerdict | null {
+  const a = k.args;
+  if (a[0] === "-l" || a[0] === "-L") return null; // list signals
+  let i = 0, sig: string | null = null;
+  if (a[0] === "-s" || a[0] === "-n") { sig = a[1] ?? ""; i = 2; }
+  else if (a[0] && a[0].startsWith("-") && a[0] !== "--" && a[0].length > 1) { sig = a[0].slice(1); i = 1; }
+  if (a[i] === "--") i++;
+  if (sig !== null && /^(SIG)?0$/i.test(sig)) return null; // signal 0 is a liveness probe; nothing is delivered
+  if (k.viaXargs && search) return { refuse: true, reason: "a process search piped into kill", match: k.text };
+  for (const t of a.slice(i)) {
+    if (/\$\(|`/.test(t)) return { refuse: true, reason: "kill target derived from a search or substitution", match: k.text };
+    if (t.startsWith("-") || t === "0") return { refuse: true, reason: "process-group / -1 target (cannot be verified as this session's)", match: k.text };
+    if (search && /^\$\{?[A-Za-z_0-9@*]/.test(t)) return { refuse: true, reason: "kill target is a variable in a command that runs a process search", match: k.text };
+  }
+  return null;
 }
 
 export function assess(command: string): KillVerdict {
   if (typeof command !== "string" || command.length === 0) return { refuse: false, reason: "no command" };
-  const noHeredoc = stripHeredocs(command);
-  for (const payload of commandPayloads(noHeredoc)) {
-    const v = assessOne(payload);
-    if (v.refuse) return { ...v, reason: `${v.reason} (inside an executed -c/eval payload)` };
+  const acc: Acc = { nameKill: null, kills: [], search: false };
+  try {
+    analyze(stripHeredocs(command), 0, acc);
+  } catch (e) {
+    if (e instanceof TooDeep || e instanceof RangeError) return { refuse: true, reason: "command nests too deeply to assess its kill targets" };
+    throw e;
   }
-  return assessOne(stripQuotes(noHeredoc));
-}
-
-function assessOne(cmd: string): KillVerdict {
-
-  const nk = cmd.match(NAME_KILLERS);
-  if (nk) return { refuse: true, reason: `${nk[2]} selects targets by NAME`, match: nk[2] };
-
-  const pk = cmd.match(PIPED_KILL);
-  if (pk) return { refuse: true, reason: "a process search piped into kill", match: pk[0].slice(0, 80) };
-
-  for (const m of cmd.matchAll(KILL_CMD)) {
-    const args = m[2] ?? "";
-    if (signalIsZero(args)) continue; // liveness probe, no signal delivered
-    if (SUBSTITUTION.test(args)) return { refuse: true, reason: "kill target derived from a search or substitution", match: `kill${args}`.trim().slice(0, 80) };
-    const g = groupTarget(args);
-    if (g) return { refuse: true, reason: "process-group / -1 target (cannot be verified as this session's)", match: `kill${args}`.trim().slice(0, 80) };
+  if (acc.nameKill) return { refuse: true, reason: `${acc.nameKill} selects targets by NAME`, match: acc.nameKill };
+  for (const k of acc.kills) {
+    const v = judgeKill(k, acc.search);
+    if (v) return v;
   }
   return { refuse: false, reason: "targets are literal pids or handles" };
 }

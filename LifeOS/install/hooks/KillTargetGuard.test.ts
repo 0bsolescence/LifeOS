@@ -55,3 +55,76 @@ describe('quoted text is data; executed payloads are commands', () => {
   test('ssh remote pkill refused', () => refuse(`ssh spare-host 'pkill -f GradleDaemon'`));
   test('xargs kill chain still refused', () => refuse('pgrep -f qemu | xargs kill'));
 });
+
+// Codex maintenance review 2026-09-25: every reproducing input, as decided.
+describe('codex P1: quoting cannot hide an executed target', () => {
+  test('double-quoted group target', () => refuse('kill -9 "-$(pgrep -n sleep)"'));
+  test('double-quoted substitution runs pkill', () => refuse('echo "$(pkill -f sleep)"'));
+  test('double-quoted variable group target', () => refuse('kill -9 "-$PG"'));
+  test('quoted command word is still the command', () => refuse(`'pkill' -f sleep`));
+  test('split-quoted command word', () => refuse(`p'k'ill -f sleep`));
+  test('apostrophe in a comment does not open a quote', () => refuse("# don't\npkill -f sleep"));
+  test('literal double-quoted prose stays data', () => allow('git commit -m "pkill is never a target"'));
+  test('metacharacters inside an expanding quote are not separators', () => allow('git commit -m "fix $HOME; pkill is prose"'));
+});
+
+describe('codex P1: search-derived variables', () => {
+  test('pgrep assigned then killed', () => refuse('TGT=$(pgrep -n sleep); kill -9 $TGT'));
+  test('braced variable after pidof', () => refuse('P=`pidof java`\nkill ${P}'));
+  test('ps|while read kill via variable', () => refuse('ps -eo pid | while read p; do kill "$p"; done'));
+  test('$! handle with no search stays allowed', () => allow('sleep 30 & P=$!; kill $P'));
+  test('search in quoted prose is not a search', () => allow(`grep -n 'pgrep' notes.md; kill $P`));
+});
+
+describe('codex P1: heredoc detection', () => {
+  test('here-string is not a heredoc', () => refuse('cat <<<EOF\nkill -9 -$(pgrep -n sleep)'));
+  test('<< inside single quotes is not a heredoc', () => refuse(`printf '%s' '<<EOF'\nkill -9 -$(pgrep -n sleep)`));
+  test('<< inside arithmetic is not a heredoc', () => refuse('echo $((1 << SHIFT))\nkill -9 -$(pgrep -n sleep)'));
+  test('quoted-tag heredoc body is data', () => allow(`cat > p.sh <<'EOF'\npkill -f sleep\nEOF`));
+  test('heredoc fed to a shell is a program', () => refuse('bash <<EOF\npkill -f sleep\nEOF'));
+  test('unquoted heredoc substitution runs at write time', () => refuse('cat > x <<EOF\n$(pkill -f sleep)\nEOF'));
+  test('command after the heredoc terminator is scanned', () => refuse('cat > x <<EOF\nhello\nEOF\nkill 0'));
+});
+
+describe('codex P1: command position and process groups', () => {
+  test('path-prefixed pkill', () => refuse('/usr/bin/pkill -f sleep'));
+  test('kill 0', () => refuse('kill 0'));
+  test('kill -9 0', () => refuse('kill -9 0'));
+  test('kill -s KILL -- -123', () => refuse('kill -s KILL -- -123'));
+  test('pkill after then', () => refuse('if true; then pkill x; fi'));
+  test('pkill in a subshell', () => refuse('( pkill x )'));
+  test('pkill in a brace group', () => refuse('{ pkill x; }'));
+  test('pkill in process substitution', () => refuse('diff <(pkill x) y'));
+  test('sudo -u root pkill', () => refuse('sudo -u root pkill -f x'));
+  test('env VAR=1 pkill', () => refuse('env FOO=1 pkill x'));
+  test('timeout 5 pkill', () => refuse('timeout 5 pkill x'));
+  test('nice -n 10 killall', () => refuse('nice -n 10 killall java'));
+  test('command pkill executes', () => refuse('command pkill x'));
+  test('backslash-escaped pkill', () => refuse('\\pkill x'));
+  test('ssh with options, unquoted remote', () => refuse('ssh -p 22 host pkill x'));
+  test('kill -0 <pid> probe stays allowed', () => allow('kill -0 12345'));
+  test('kill -0 0 is a probe', () => allow('kill -0 0'));
+  test('kill -l lists signals', () => allow('kill -l'));
+});
+
+describe('codex P2: ordinary commands are not refused', () => {
+  test('command -v pkill', () => allow('command -v pkill'));
+  test('echo pkill', () => allow('echo pkill'));
+  test('systemctl kill with a substitution argument', () => allow('systemctl kill $(printf lifeos.service)'));
+  test('systemctl --user kill unit', () => allow('systemctl --user kill lifeos.service'));
+  test('which killall', () => allow('which killall'));
+});
+
+describe('performance: no quadratic regex', () => {
+  const big = (tok: string) => tok.repeat(Math.ceil(65536 / tok.length)).slice(0, 65536);
+  for (const tok of ['ssh a ', 'kill ', "'a' ", '"$x" ', 'a ', 'sudo ', '<< ', '$(a) ']) {
+    test(`64 KB of ${JSON.stringify(tok)} under 50 ms`, () => {
+      const cmd = big(tok);
+      assess(cmd); // warm
+      const t0 = performance.now();
+      assess(cmd);
+      expect(performance.now() - t0).toBeLessThan(50);
+    });
+  }
+  test('pathological nesting is refused, not a crash', () => expect(assess('"$('.repeat(5000)).refuse).toBe(true));
+});
