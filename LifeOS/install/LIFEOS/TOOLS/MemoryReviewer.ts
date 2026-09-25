@@ -32,7 +32,10 @@
 
 import {
   appendFileSync,
+  closeSync,
+  openSync,
   unlinkSync,
+  writeSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -64,7 +67,13 @@ const HARNESS_PROJECTS_DIR = pathResolve(homedir(), ".claude", "projects");
 const REVIEWER_OBS_DIR = process.env.LIFEOS_REVIEWER_OBS_DIR || pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY");
 const RUNS_LOG_PATH = pathResolve(REVIEWER_OBS_DIR, "reviewer-runs.jsonl");
 const RUN_LOCK_PATH = pathResolve(REVIEWER_OBS_DIR, "reviewer-runs/.run.lock");
-const RUN_LOCK_STALE_MS = 15 * 60 * 1000; // a run holds the lock while alive; a dead pid or 15 min frees it
+// A run holds the lock while its pid lives. A dead pid frees it at once; a live pid that has held it
+// for 30 min is treated as hung (inference timeout is far shorter) and is taken over, with the
+// takeover recorded on the new run's rows.
+const RUN_LOCK_HUNG_MS = 30 * 60 * 1000;
+// A lock file that exists but does not parse is one being written right now (O_EXCL create, then
+// write); only after this long is it treated as debris.
+const RUN_LOCK_UNREADABLE_GRACE_MS = 30 * 1000;
 
 /** Terminal states a run row can carry (2026-09-25, weekend ISA F4). `started` is the
  *  non-terminal marker written before inference so an interrupted run leaves evidence. */
@@ -602,9 +611,10 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
 
 // ── Observability ──
 
-function tsSlug(): string {
-  return new Date().toISOString().replace(/[:.]/g, "-");
+function tsSlug(d: Date = new Date()): string {
+  return d.toISOString().replace(/[:.]/g, "-");
 }
+let lastRunIdMs = 0;
 
 function logRunSummary(row: Record<string, unknown>): void {
   try {
@@ -628,70 +638,118 @@ function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
 }
 
-export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): { ok: true } | { ok: false; holder: { pid: number; runId: string; started: string } } {
+type LockHolder = { pid: number; runId: string; started: string };
+export type LockResult = { ok: true; takeover?: string } | { ok: false; holder: LockHolder };
+
+// Per-run terminal state. A process may host more than one review() (an importing caller), so
+// nothing about "the" run is module-global: each runId owns its row and its lock.
+interface RunState { runId: string; transcript: string | null; exchanges: number; startedMs: number; written: boolean; lockPath: string; note?: string }
+const runs = new Map<string, RunState>();
+
+function readHolder(lockPath: string): LockHolder | null {
+  try {
+    const h = JSON.parse(readFileSync(lockPath, "utf8"));
+    return h && typeof h.pid === "number" && typeof h.runId === "string" && typeof h.started === "string" ? h : null;
+  } catch { return null; }
+}
+
+// Why a holder no longer owns the lock, or null if it still does.
+function staleReason(holder: LockHolder | null, lockPath: string, nowMs: number): string | null {
+  if (!holder) {
+    let ageMs = 0;
+    try { ageMs = nowMs - statSync(lockPath).mtimeMs; } catch { return "lock vanished"; }
+    return ageMs > RUN_LOCK_UNREADABLE_GRACE_MS ? `unreadable lock ${Math.round(ageMs / 1000)}s old` : null;
+  }
+  const startedMs = Date.parse(holder.started);
+  if (holder.pid === process.pid) {
+    // Same process: held only while that run is still active here.
+    const r = runs.get(holder.runId);
+    if (!r || r.written) return `own-process leftover from run ${holder.runId}`;
+  } else if (!pidAlive(holder.pid)) {
+    return `holder pid ${holder.pid} is dead`;
+  }
+  if (!Number.isFinite(startedMs)) return `holder start time unreadable`;
+  if (nowMs - startedMs > RUN_LOCK_HUNG_MS) return `holder pid ${holder.pid} alive but holding since ${holder.started} (> ${RUN_LOCK_HUNG_MS / 60000} min: hung)`;
+  return null;
+}
+
+/** Exclusive run lock: created with O_EXCL (`wx`), never truncate-then-write. On EEXIST the holder
+ *  is read; a dead or hung holder is unlinked and creation retried once; a live one refuses. */
+export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): LockResult {
+  const body = JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() });
+  const create = (): boolean => {
+    let fd: number;
+    try { fd = openSync(lockPath, "wx"); } catch (e: any) { if (e?.code === "EEXIST") return false; throw e; }
+    try { writeSync(fd, body); } finally { closeSync(fd); }
+    return true;
+  };
   try {
     mkdirSync(dirname(lockPath), { recursive: true });
-    if (existsSync(lockPath)) {
-      let holder: any = null;
-      try { holder = JSON.parse(readFileSync(lockPath, "utf8")); } catch { holder = null; }
-      const startedMs = holder?.started ? Date.parse(holder.started) : NaN;
-      const fresh = Number.isFinite(startedMs) && nowMs - startedMs < RUN_LOCK_STALE_MS;
-      const alive = typeof holder?.pid === "number" && holder.pid !== process.pid && pidAlive(holder.pid);
-      if (holder && fresh && alive) return { ok: false, holder };
-      // stale (dead pid or older than the window): take over
-    }
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() }), "utf8");
-    return { ok: true };
+    if (create()) return { ok: true };
+    const holder = readHolder(lockPath);
+    const reason = staleReason(holder, lockPath, nowMs);
+    if (reason === null) return { ok: false, holder: holder ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
+    // Re-read immediately before unlinking so a lock another process just took over is not removed.
+    const again = readHolder(lockPath);
+    if (JSON.stringify(again) !== JSON.stringify(holder)) return { ok: false, holder: again ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
+    try { unlinkSync(lockPath); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+    if (create()) return { ok: true, takeover: `took over run lock from ${holder?.runId ?? "an unreadable lock"}: ${reason}` };
+    const winner = readHolder(lockPath);
+    return { ok: false, holder: winner ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
   } catch {
-    return { ok: true }; // lock is best-effort; never block a run on a lock write failure
+    return { ok: true, takeover: "run lock unavailable (filesystem error); ran unlocked" }; // never block a run on a lock I/O failure
   }
 }
 
-export function releaseRunLock(lockPath: string = RUN_LOCK_PATH): void {
+/** Release only a lock this process and this run hold. */
+export function releaseRunLock(lockPath: string = RUN_LOCK_PATH, runId?: string): void {
   try {
-    if (!existsSync(lockPath)) return;
-    const holder = JSON.parse(readFileSync(lockPath, "utf8"));
-    if (holder?.pid === process.pid) unlinkSync(lockPath);
+    const holder = readHolder(lockPath);
+    if (holder && holder.pid === process.pid && (runId === undefined || holder.runId === runId)) unlinkSync(lockPath);
   } catch { /* best-effort */ }
 }
 
-let activeRun: { runId: string; transcript: string | null; exchanges: number; startedMs: number } | null = null;
-let terminalRowWritten = false;
-
-function writeTerminalRow(row: Record<string, unknown>): void {
-  if (terminalRowWritten) return;
-  terminalRowWritten = true;
-  logRunSummary({ ts: new Date().toISOString(), ...row });
-  releaseRunLock();
+function writeTerminalRow(runId: string, row: Record<string, unknown>): void {
+  const run = runs.get(runId);
+  if (run?.written) return;
+  if (run) run.written = true;
+  logRunSummary({ ts: new Date().toISOString(), ...row, ...(run?.note && row.note === undefined ? { note: run.note } : {}) });
+  releaseRunLock(run?.lockPath ?? RUN_LOCK_PATH, runId);
 }
 
-function interruptedRow(reason: string): Record<string, unknown> {
-  const a = activeRun;
+function abandonedRow(run: RunState, status: "interrupted" | "failed", reason: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     ok: false,
-    status: "interrupted",
-    runId: a?.runId ?? "unknown",
-    transcript: a?.transcript ?? null,
-    exchanges: a?.exchanges ?? 0,
-    inference_duration_ms: a ? Date.now() - a.startedMs : 0,
+    status,
+    runId: run.runId,
+    transcript: run.transcript,
+    exchanges: run.exchanges,
+    inference_duration_ms: Date.now() - run.startedMs,
     parse_ok: false,
     error: reason,
+    ...extra,
   };
 }
 
+function finishAllActive(status: "interrupted" | "failed", reason: string, extra: Record<string, unknown> = {}): void {
+  for (const run of runs.values()) if (!run.written) writeTerminalRow(run.runId, abandonedRow(run, status, reason, extra));
+}
+
+const SIGNAL_EXIT: Record<string, number> = { SIGTERM: 143, SIGHUP: 129, SIGINT: 130 };
 let handlersInstalled = false;
 function installExitHandlers(): void {
   if (handlersInstalled) return;
   handlersInstalled = true;
   for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
-    process.on(sig, () => { writeTerminalRow(interruptedRow(`interrupted: ${sig}`)); process.exit(130); });
+    process.on(sig, () => { finishAllActive("interrupted", `interrupted: ${sig}`); process.exit(SIGNAL_EXIT[sig]); });
   }
+  const stackOf = (e: any) => String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ");
   process.on("uncaughtException", (e: any) => {
-    writeTerminalRow({ ...interruptedRow(`failed: uncaught ${e?.name ?? "Error"}: ${e?.message ?? String(e)}`), status: "failed", stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    finishAllActive("failed", `failed: uncaught ${e?.name ?? "Error"}: ${e?.message ?? String(e)}`, { stack: stackOf(e) });
     process.exit(1);
   });
   process.on("unhandledRejection", (e: any) => {
-    writeTerminalRow({ ...interruptedRow(`failed: unhandled rejection: ${e?.message ?? String(e)}`), status: "failed", stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    finishAllActive("failed", `failed: unhandled rejection: ${e?.message ?? String(e)}`, { stack: stackOf(e) });
     process.exit(1);
   });
 }
@@ -734,9 +792,11 @@ export interface ReviewResult {
 }
 
 export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
-  const runId = tsSlug();
+  // Run ids are millisecond timestamps; two runs in one process never share one.
+  const idMs = Math.max(Date.now(), lastRunIdMs + 1);
+  lastRunIdMs = idMs;
+  const runId = tsSlug(new Date(idMs));
   const turns = opts.turns ?? DEFAULT_TURNS;
-  terminalRowWritten = false;
   installExitHandlers();
 
   // 0. One reviewer at a time: overlapping runs would dispatch the same items twice.
@@ -744,22 +804,33 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
   if (!lock.ok) {
     const result: ReviewResult = { ok: true, runId, transcript: null, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped-overlap", error: `skipped: reviewer ${lock.holder.runId} (pid ${lock.holder.pid}) is still running since ${lock.holder.started}` };
     logRunSummary({ ts: new Date().toISOString(), ...result });
-    terminalRowWritten = true;
     return result;
   }
+  const run: RunState = { runId, transcript: null, exchanges: 0, startedMs: Date.now(), written: false, lockPath: RUN_LOCK_PATH, ...(lock.takeover ? { note: lock.takeover } : {}) };
+  runs.set(runId, run);
   try {
-    return await reviewLocked(runId, turns, opts);
+    return await reviewLocked(run, turns, opts);
+  } catch (e: any) {
+    // Anything thrown before a terminal row (EISDIR on --input <dir>, an unreadable transcript,
+    // a snapshot read) still leaves a row carrying this run's id.
+    const failed: ReviewResult = { ok: false, runId, transcript: run.transcript, exchanges: run.exchanges, inference_duration_ms: Date.now() - run.startedMs, parse_ok: false, status: "failed", error: `failed: ${e?.name ?? "Error"}${e?.code ? ` ${e.code}` : ""}: ${e?.message ?? String(e)}` };
+    writeTerminalRow(runId, { ...(failed as any), stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    return failed;
   } finally {
-    releaseRunLock();
+    if (!run.written) writeTerminalRow(runId, abandonedRow(run, "failed", "failed: review returned without a terminal row"));
+    releaseRunLock(run.lockPath, runId);
+    runs.delete(runId);
   }
 }
 
-async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): Promise<ReviewResult> {
+async function reviewLocked(run: RunState, turns: number, opts: ReviewOptions): Promise<ReviewResult> {
+  const runId = run.runId;
   // 1. Locate transcript
   const transcript = opts.input ?? findMostRecentTranscript();
+  run.transcript = transcript ?? null;
   if (!transcript) {
     const result: ReviewResult = { ok: true, runId, transcript: null, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped", error: "skipped: no transcript available" };
-    writeTerminalRow(result as any);
+    writeTerminalRow(runId, result as any);
     return result;
   }
 
@@ -767,13 +838,18 @@ async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): 
   const exchanges = extractRecentExchanges(transcript, turns);
   if (exchanges.length === 0) {
     const result: ReviewResult = { ok: true, runId, transcript, exchanges: 0, inference_duration_ms: 0, parse_ok: true, skipped: true, status: "skipped", error: "skipped: no exchanges extracted (empty or just-cleared transcript)" };
-    writeTerminalRow(result as any);
+    writeTerminalRow(runId, result as any);
     return result;
   }
 
   // 2b. Started row: from here on, a missing terminal row means the process was ended, not that it never ran.
-  activeRun = { runId, transcript, exchanges: exchanges.length, startedMs: Date.now() };
-  logRunSummary({ ts: new Date().toISOString(), status: "started", runId, transcript, exchanges: exchanges.length, pid: process.pid });
+  run.exchanges = exchanges.length;
+  run.startedMs = Date.now();
+  logRunSummary({ ts: new Date().toISOString(), status: "started", runId, transcript, exchanges: exchanges.length, pid: process.pid, ...(run.note ? { error: run.note } : {}) });
+  // Test hook: hold the run open so a real signal can be delivered mid-run. Honoured only
+  // against a temp observability root, never in the live tree.
+  const testSleepMs = process.env.LIFEOS_REVIEWER_OBS_DIR ? Number(process.env.LIFEOS_REVIEWER_TEST_SLEEP_MS ?? 0) : 0;
+  if (testSleepMs > 0) await new Promise((r) => setTimeout(r, testSleepMs));
 
   // 3. Build prompt — inject CURRENT memory state so the reviewer curates
   //    against reality (the op:"set" path REPLACES, so it must see what's there).
@@ -808,7 +884,7 @@ async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): 
     if (!result.success) {
       const timedOut = /time ?out|timed out|ETIMEDOUT/i.test(String(result.error));
       const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, status: timedOut ? "timed-out" : "failed", error: `inference failed: ${result.error}` };
-      writeTerminalRow(failed as any);
+      writeTerminalRow(runId, failed as any);
       return failed;
     }
     inferenceOutput = result.output;
@@ -843,7 +919,7 @@ async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): 
       "parse-error.txt": stripPrivateContent(`${parsed.error}\n\nRaw:\n${parsed.raw}`),
     });
     const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, status: "failed", error: `parse failed: ${parsed.error}` };
-    writeTerminalRow(failed as any);
+    writeTerminalRow(runId, failed as any);
     return failed;
   }
   writeRunDebug(runId, { "response.parsed.json": JSON.stringify(parsed.output, null, 2) });
@@ -855,7 +931,7 @@ async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): 
   } catch (e: any) {
     const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: true, status: "failed", error: `dispatch threw: ${e?.name ?? "Error"}: ${e?.message ?? String(e)}` };
     writeRunDebug(runId, { "dispatch.log": `THREW before completing dispatch: ${String(e?.stack ?? e)}` });
-    writeTerminalRow({ ...(failed as any), stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
+    writeTerminalRow(runId, { ...(failed as any), stack: String(e?.stack ?? "").split("\n").slice(0, 6).join(" | ") });
     return failed;
   }
   writeRunDebug(runId, {
@@ -885,7 +961,7 @@ async function reviewLocked(runId: string, turns: number, opts: ReviewOptions): 
     status: writeErrors.length === 0 ? "completed" : "failed",
     ...(writeErrors.length === 0 ? {} : { error: writeErrors.join("; ") }),
   };
-  writeTerminalRow(result as any);
+  writeTerminalRow(runId, result as any);
   return result;
 }
 
