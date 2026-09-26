@@ -128,3 +128,12 @@ describe('performance: no quadratic regex', () => {
   }
   test('pathological nesting is refused, not a crash', () => expect(assess('"$('.repeat(5000)).refuse).toBe(true));
 });
+
+describe('codex re-review: new P1 regressions', () => {
+  test('attached redirection does not hide pkill', () => refuse('pkill</dev/null -f sleep'));
+  test('attached output redirection does not hide pkill', () => refuse('pkill>/dev/null -f sleep'));
+  test('env --unset VAR pkill', () => refuse('env --unset HOME pkill -f sleep'));
+  test('sudo --user root pkill', () => refuse('sudo --user root pkill -f sleep'));
+  test('fd redirections still parse', () => allow('make build 2>&1 >/dev/null; echo done 2>/dev/null'));
+  test('sudo --user root on a safe command', () => allow('sudo --user root systemctl status x'));
+});

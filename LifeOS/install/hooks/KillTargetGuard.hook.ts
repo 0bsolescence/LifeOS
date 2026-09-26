@@ -114,6 +114,11 @@ const WRAPPERS: Record<string, string> = {
   watch: "nd", nice: "n", ionice: "cnp", setsid: "", timeout: "sk", command: "", builtin: "",
   eval: "", time: "fo", stdbuf: "ioe", ssh: "bcDEeFIiJLlmOoPpQRSWw",
 };
+// Long wrapper options that take a SEPARATE value (`sudo --user root`, `env --unset HOME`).
+const LONG_TAKES_ARG = new Set(["--user", "--group", "--host", "--prompt", "--chdir", "--role", "--type", "--close-from", "--other-user",
+  "--unset", "--split-string", "--signal", "--kill-after", "--adjustment", "--class", "--classdata", "--pid",
+  "--max-args", "--max-procs", "--delimiter", "--arg-file", "--replace", "--max-lines", "--max-chars", "--eof",
+  "--interval", "--input", "--output", "--error", "--format", "--argv0"]);
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 const REDIR = /^\d*(&?>>?|<>?|>&|<&|>\|)/;
 const base = (w: string) => { const x = w.replace(/\\/g, ""); return x.slice(x.lastIndexOf("/") + 1); };
@@ -134,6 +139,7 @@ function walk(words: string[]): Walk {
         const o = words[i++];
         if (o === "--") break;
         if (o.length === 2 && takesArg.includes(o[1])) i++;
+        else if (LONG_TAKES_ARG.has(o)) i++;
       }
       if (b === "env") while (i < words.length && ASSIGN.test(words[i])) i++;
       if (b === "timeout") i++; // the duration
@@ -310,6 +316,8 @@ function analyze(raw: string, depth: number, acc: Acc): void {
     if (c === "`") { const j = endOfBacktick(t, i + 1); cur += t.slice(i, j + 1); groups.push(t.slice(i + 1, j)); i = j; continue; }
     if (";&|\n()".includes(c)) { end(); continue; }
     if (c === " " || c === "\t" || c === "\r") { flush(); continue; }
+    // A redirection attached to a word (`pkill</dev/null`) is its own word; an fd prefix (`2>`) stays with it.
+    if ((c === "<" || c === ">") && cur !== "" && !/^\d+$/.test(cur) && !/[<>]$/.test(cur)) flush();
     cur += c;
   }
   end();
