@@ -41,11 +41,12 @@ const LEARNING_DIR = path.join(CLAUDE_DIR, "LIFEOS", "MEMORY", "LEARNING");
 // Patterns indicating learning moments in conversations
 // 2026-09-25 (dawn brief 09-22 § harvester noise; 266 "corrections" in September): the bare
 // "actually," / "wait," matched anywhere in a user turn, so a long dispatch containing either
-// word was filed as a correction. They now count only when they OPEN a turn (a real
-// interjection), and a turn that is a pasted document or a raven/reviewer prompt is skipped
-// below (isPromptShapedTurn). The six explicit shapes are unchanged.
+// word was filed as a correction. They now count only when they OPEN a sentence (a real
+// interjection: "Actually, use X." or "Thanks. Actually, use X."), never mid-sentence ("and
+// actually finish Y"). Embedded documents are stripped before matching (stripEmbeddedBlocks),
+// and what remains is judged on its own (isCorrectionTurn). The six explicit shapes are unchanged.
 const CORRECTION_PATTERNS = [
-  /^\s*(?:actually|wait),?\s+/i,
+  /(?:^|[.!?]\s+|\n\s*)(?:actually|wait),?\s+/i,
   /no,?\s+i meant/i,
   /let me clarify/i,
   /that's not (quite )?right/i,
@@ -146,7 +147,7 @@ interface MinedMemory {
   sourceLine: number;
 }
 
-interface HarvestedLearning {
+export interface HarvestedLearning {
   sessionId: string;
   timestamp: string;
   category: 'SYSTEM' | 'ALGORITHM';
@@ -260,20 +261,57 @@ export function isPromptShapedTurn(text: string): boolean {
   return false;
 }
 
-function harvestLearnings(sessionPath: string): HarvestedLearning[] {
+/** Remove material the principal pasted or a machine injected — pasted documents, teammate and
+ *  cross-session messages (an unterminated block runs to the end), and the reviewer's
+ *  memory-state block through the end of the turn — so what remains is what was actually said. */
+export function stripEmbeddedBlocks(text: string): string {
+  let out = text;
+  for (const tag of ["pasted_content", "teammate-message", "cross-session-message"]) {
+    out = out.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?(?:</${tag}>|$)`, "gi"), " ");
+  }
+  const mem = out.indexOf("── CURRENT MEMORY STATE");
+  if (mem >= 0) out = out.slice(0, mem);
+  return out.trim();
+}
+
+/** A correction of the assistant, judged on the turn with embedded blocks removed: the
+ *  remainder must itself not be prompt-shaped and must match a correction pattern. */
+export function isCorrectionTurn(text: string): { matches: boolean; matchedPattern: string | null } {
+  const said = stripEmbeddedBlocks(text);
+  if (said.length < 10 || isPromptShapedTurn(said)) return { matches: false, matchedPattern: null };
+  return matchesPatterns(said, CORRECTION_PATTERNS);
+}
+
+/** A raven spawned by the Agent tool gets a top-level transcript whose first entries carry
+ *  {type:"agent-setting", agentSetting:…}; the principal's own sessions never do. Reads at most
+ *  the first 4096 bytes through a file descriptor, never the whole file. */
+export function isAgentTranscriptHead(sessionPath: string): boolean {
+  const HEAD_BYTES = 4096;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(sessionPath, "r");
+    const buf = Buffer.alloc(HEAD_BYTES);
+    const n = fs.readSync(fd, buf, 0, HEAD_BYTES, 0);
+    const lines = buf.subarray(0, n).toString("utf-8").split("\n");
+    if (n === HEAD_BYTES) lines.pop(); // a partial last line is not parsed
+    for (const line of lines) {
+      try { const e = JSON.parse(line); if (e?.type === "agent-setting" && e?.agentSetting) return true; } catch { /* not json */ }
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+export function harvestLearnings(sessionPath: string): HarvestedLearning[] {
   const learnings: HarvestedLearning[] = [];
   const sessionId = path.basename(sessionPath, '.jsonl');
   // 2026-09-25: a raven's or the reviewer's transcript is instructions, not the principal's
   // conversation; nothing in it is a correction OF the assistant BY the principal.
   if (/[\/]subagents[\/]|[\/]agent-[^\/]+\.jsonl$/.test(sessionPath)) return learnings;
-  // A raven spawned by the Agent tool gets a top-level transcript whose first entries carry
-  // {type:"agent-setting", agentSetting:…}; the principal's own sessions never do.
-  {
-    const head = fs.readFileSync(sessionPath, 'utf-8').split('\n', 12);
-    for (const line of head) {
-      try { const e = JSON.parse(line); if (e?.type === 'agent-setting' && e?.agentSetting) return learnings; } catch { /* not json */ }
-    }
-  }
+  if (isAgentTranscriptHead(sessionPath)) return learnings;
 
   const content = fs.readFileSync(sessionPath, 'utf-8');
   const lines = content.split('\n').filter(line => line.trim());
@@ -295,8 +333,8 @@ function harvestLearnings(sessionPath: string): HarvestedLearning[] {
       // the memory reviewer's own prompt is an instruction, not a correction of the assistant;
       // a capture with no preceding assistant turn (empty context) is a prompt by construction.
       if (entry.type === 'user') {
-        const { matches, matchedPattern } = matchesPatterns(textContent, CORRECTION_PATTERNS);
-        if (matches && !isPromptShapedTurn(textContent) && previousContext.length > 0) {
+        const { matches, matchedPattern } = isCorrectionTurn(textContent);
+        if (matches && previousContext.length > 0) {
           learnings.push({
             sessionId,
             timestamp,
