@@ -33,9 +33,7 @@
 import {
   appendFileSync,
   closeSync,
-  linkSync,
   openSync,
-  renameSync,
   unlinkSync,
   writeSync,
   existsSync,
@@ -677,15 +675,19 @@ function staleReason(holder: LockHolder | null, lockPath: string, nowMs: number)
 
 /** Exclusive run lock: created with O_EXCL (`wx`), never truncate-then-write. On EEXIST the holder
  *  is read; a live holder under 30 minutes refuses; a dead, hung or long-unreadable holder is taken
- *  over by `takeOverStaleLock` (rename-and-verify), and only the contender whose rename moved the
- *  very lock it judged stale goes on to create a fresh lock with `wx`.
+ *  over through `takeOverStaleLock`, and the taker then creates its fresh lock with `wx`.
  *
- *  Why rename: an interrupted run leaves a dead-pid lock, and two Stop hooks (or a manual
- *  `review`) can then contend for it in the same moment. With check-then-unlink, A could unlink
- *  the fresh lock B had just created and both would dispatch the same items. rename(2) is atomic:
- *  of the contenders renaming the same path, exactly one moves a given file.
- *  Release is pid+runId-checked; its read-then-unlink window only matters after a sanctioned
- *  30-minute hung-holder takeover of a still-live run. */
+ *  Why a takeover mutex: an interrupted run leaves a dead-pid lock, and two Stop hooks (or a
+ *  manual `review`) can contend for it in the same moment. Check-then-unlink let A remove the fresh
+ *  lock B had just created; rename-and-verify (4858abd) let B move A's fresh lock aside and expose
+ *  the path to a third contender before B could notice the mismatch (Codex delta review). Now
+ *  takeovers are serialised by `<lock>.takeover` (O_EXCL), and under it the lock is re-read and
+ *  removed only if it is still byte-for-byte the lock judged stale. Nothing else changes a
+ *  dead-pid lock, so a lock that is not the stale one is never moved or removed.
+ *  Residuals, both requiring a coincidence on top of contention: a HUNG (live, >30 min) holder that
+ *  releases in the instant between the taker's re-read and its unlink; and a takeover mutex left by
+ *  a process that crashed inside its microsecond hold (cleared after 60 s, see takeOverStaleLock).
+ *  Release is pid+runId-checked. */
 export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): LockResult {
   const body = JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() });
   const create = (): boolean => {
@@ -703,7 +705,7 @@ export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, 
     const holder = readHolder(lockPath, raw);
     const reason = staleReason(holder, lockPath, nowMs);
     if (reason === null) return { ok: false, holder: holder ?? unknownHolder };
-    if (!takeOverStaleLock(lockPath, raw)) return { ok: false, holder: readHolder(lockPath) ?? unknownHolder };
+    if (!takeOverStaleLock(lockPath, raw, nowMs)) return { ok: false, holder: readHolder(lockPath) ?? unknownHolder };
     if (create()) return { ok: true, takeover: `took over run lock from ${holder?.runId ?? "an unreadable lock"}: ${reason}` };
     return { ok: false, holder: readHolder(lockPath) ?? unknownHolder };
   } catch {
@@ -711,23 +713,40 @@ export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, 
   }
 }
 
-/** Move a lock judged stale out of the way, atomically. Renames it to a name unique to this process,
- *  then verifies the moved file is byte-for-byte the one judged stale. Returns false (refuse) when
- *  the rename finds nothing (another contender already took it) or moved a different lock (another
- *  contender already created a fresh one), in which case that lock is linked back into place. */
-export function takeOverStaleLock(lockPath: string, judgedRaw: string): boolean {
-  const aside = `${lockPath}.${process.pid}.stale`;
-  try { renameSync(lockPath, aside); } catch (e: any) { if (e?.code === "ENOENT") return false; throw e; }
-  let moved: string | null = null;
-  try { moved = readFileSync(aside, "utf8"); } catch { moved = null; }
-  if (moved !== judgedRaw) {
-    // Not the lock we judged: put it back (link fails if yet another lock appeared; then leave it).
-    try { linkSync(aside, lockPath); } catch { /* a newer lock holds the path */ }
-    try { unlinkSync(aside); } catch { /* best-effort */ }
-    return false;
+const TAKEOVER_MUTEX_STALE_MS = 60 * 1000;
+
+/** Remove a lock judged stale, serialised against every other taker. Takes `<lock>.takeover` with
+ *  O_EXCL (a mutex left by a dead process, or older than 60 s, is cleared first); under it, re-reads
+ *  the lock and unlinks it only if it is still exactly `judgedRaw`. Returns false (refuse) when the
+ *  mutex is held by a live taker, the lock is gone, or the lock is no longer the one judged stale
+ *  (another contender already took over). The caller then creates its lock with `wx`. */
+export function takeOverStaleLock(lockPath: string, judgedRaw: string, nowMs: number = Date.now()): boolean {
+  const mutex = `${lockPath}.takeover`;
+  const mine = JSON.stringify({ pid: process.pid, at: new Date(nowMs).toISOString() });
+  const take = (): boolean => {
+    let fd: number;
+    try { fd = openSync(mutex, "wx"); } catch (e: any) { if (e?.code === "EEXIST") return false; throw e; }
+    try { writeSync(fd, mine); } finally { closeSync(fd); }
+    return true;
+  };
+  if (!take()) {
+    let held: any = null, ageMs = 0;
+    try { held = JSON.parse(readFileSync(mutex, "utf8")); } catch { held = null; }
+    try { ageMs = nowMs - statSync(mutex).mtimeMs; } catch { return false; }
+    const dead = typeof held?.pid === "number" && held.pid !== process.pid && !pidAlive(held.pid);
+    if (!dead && ageMs <= TAKEOVER_MUTEX_STALE_MS) return false; // another taker is mid-takeover
+    try { unlinkSync(mutex); } catch { /* another taker cleared it */ }
+    if (!take()) return false;
   }
-  try { unlinkSync(aside); } catch { /* best-effort */ }
-  return true;
+  try {
+    let current: string;
+    try { current = readFileSync(lockPath, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return false; throw e; }
+    if (current !== judgedRaw) return false;
+    unlinkSync(lockPath);
+    return true;
+  } finally {
+    try { if (readFileSync(mutex, "utf8") === mine) unlinkSync(mutex); } catch { /* best-effort */ }
+  }
 }
 
 /** Release only a lock this process and this run hold. */

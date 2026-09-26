@@ -193,11 +193,11 @@ describe("a real SIGTERM mid-run", () => {
   }, 30_000);
 });
 
-// ── Stale-lock takeover is rename-and-verify (2026-09-25, closes the check-then-unlink race) ──
+// ── Stale-lock takeover is serialised by a takeover mutex (2026-09-25; closes the check-then-unlink race and the rename gap) ──
 async function deadPid(): Promise<number> {
   const p = Bun.spawn(["true"]); await p.exited; return p.pid; // a pid we launched and that has exited
 }
-describe("stale takeover: rename-and-verify", () => {
+describe("stale takeover: serialised, never moves a lock that is not the stale one", () => {
   test("two processes contending for a dead-pid lock: exactly one runs", async () => {
     for (let round = 0; round < 3; round++) {
       clearLock();
@@ -212,26 +212,53 @@ describe("stale takeover: rename-and-verify", () => {
       expect(fresh.filter((x) => x.status === "started").length).toBe(1);
       expect(outs.sort()).toEqual(["completed", "skipped-overlap"]);
       expect(existsSync(LOCK)).toBe(false);
-      expect(require("node:fs").readdirSync(join(root, "reviewer-runs")).filter((f: string) => f.endsWith(".stale"))).toEqual([]);
+      expect(require("node:fs").readdirSync(join(root, "reviewer-runs")).filter((f: string) => f.endsWith(".takeover"))).toEqual([]);
     }
   }, 60_000);
 
-  test("a contender whose rename finds the lock already gone refuses", () => {
+  test("a contender that finds the stale lock already gone refuses", () => {
     clearLock();
     expect(takeOverStaleLock(LOCK, JSON.stringify({ pid: 1, runId: "gone", started: "x" }))).toBe(false);
     expect(existsSync(LOCK)).toBe(false);
   });
 
-  test("a contender that moved a fresh lock (not the one judged stale) refuses and puts it back", () => {
+  test("Codex interleaving: A took over; B (judged the old lock) refuses and never moves A's lock, so C cannot slip in", async () => {
     clearLock();
-    const judged = JSON.stringify({ pid: 999999, runId: "judged-stale", started: new Date().toISOString() });
-    const fresh = JSON.stringify({ pid: process.pid, runId: "winner", started: new Date().toISOString() });
-    writeFileSync(LOCK, fresh); // the other contender already took over and created its lock
-    expect(takeOverStaleLock(LOCK, judged)).toBe(false);
-    expect(readFileSync(LOCK, "utf8")).toBe(fresh);
-    expect(require("node:fs").readdirSync(join(root, "reviewer-runs")).filter((f: string) => f.endsWith(".stale"))).toEqual([]);
-    clearLock();
+    const stale = JSON.stringify({ pid: 999999, runId: "judged-stale", started: new Date().toISOString() });
+    writeFileSync(LOCK, stale);
+    // A: judges, takes over, creates its fresh lock.
+    expect(takeOverStaleLock(LOCK, stale)).toBe(true);
+    expect(acquireRunLock("A-run", LOCK).ok).toBe(true);
+    const aLock = readFileSync(LOCK, "utf8");
+    // B resumes with its old judgment: it must refuse without touching the path.
+    expect(takeOverStaleLock(LOCK, stale)).toBe(false);
+    expect(readFileSync(LOCK, "utf8")).toBe(aLock);
+    // C arrives from another process: the path was never absent, and A (this live process) holds it.
+    const cProc = holderChild("C-run", 0);
+    const c = await firstLine(cProc);
+    await cProc.exited;
+    expect(c.ok).toBe(false);
+    expect(c.holder.runId).toBe("A-run");
+    expect(JSON.parse(readFileSync(LOCK, "utf8")).runId).toBe("A-run");
+    releaseRunLock(LOCK, "A-run");
+    expect(existsSync(LOCK)).toBe(false);
   });
+
+  test("a takeover mutex held by a live taker refuses; one left by a dead process is cleared", async () => {
+    clearLock();
+    const MUTEX = `${LOCK}.takeover`;
+    const stale = JSON.stringify({ pid: 999999, runId: "judged-stale", started: new Date().toISOString() });
+    const sleeper = Bun.spawn(["sleep", "30"]);
+    writeFileSync(LOCK, stale);
+    writeFileSync(MUTEX, JSON.stringify({ pid: sleeper.pid, at: new Date().toISOString() }));
+    expect(takeOverStaleLock(LOCK, stale)).toBe(false);
+    expect(readFileSync(LOCK, "utf8")).toBe(stale);
+    sleeper.kill("SIGKILL"); await sleeper.exited; // our own launch handle
+    writeFileSync(MUTEX, JSON.stringify({ pid: await deadPid(), at: new Date().toISOString() }));
+    expect(takeOverStaleLock(LOCK, stale)).toBe(true);
+    expect(existsSync(LOCK)).toBe(false);
+    expect(existsSync(MUTEX)).toBe(false);
+  }, 20_000);
 
   test("a live holder is never taken before 30 min", async () => {
     clearLock();
