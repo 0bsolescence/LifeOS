@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "reviewer-status-"));
 process.env.LIFEOS_REVIEWER_OBS_DIR = root;
-const { review, acquireRunLock, releaseRunLock } = await import("./MemoryReviewer");
+const { review, acquireRunLock, releaseRunLock, takeOverStaleLock } = await import("./MemoryReviewer");
 const LOG = join(root, "reviewer-runs.jsonl");
 const LOCK = join(root, "reviewer-runs/.run.lock");
 const rows = () => (existsSync(LOG) ? readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
@@ -191,4 +191,58 @@ describe("a real SIGTERM mid-run", () => {
     expect(mine[1].error).toMatch(/SIGTERM/);
     expect(existsSync(LOCK)).toBe(false);
   }, 30_000);
+});
+
+// ── Stale-lock takeover is rename-and-verify (2026-09-25, closes the check-then-unlink race) ──
+async function deadPid(): Promise<number> {
+  const p = Bun.spawn(["true"]); await p.exited; return p.pid; // a pid we launched and that has exited
+}
+describe("stale takeover: rename-and-verify", () => {
+  test("two processes contending for a dead-pid lock: exactly one runs", async () => {
+    for (let round = 0; round < 3; round++) {
+      clearLock();
+      mkdirSync(join(root, "reviewer-runs"), { recursive: true });
+      writeFileSync(LOCK, JSON.stringify({ pid: await deadPid(), runId: `dead-run-${round}`, started: new Date().toISOString() }));
+      const t = transcript();
+      const before = rows().length;
+      const src = `const m = await import(${JSON.stringify(MOD)}); const r = await m.review({ input: ${JSON.stringify(t)}, mockInferenceResponse: '{"items":[]}', dryRun: true, turns: 2 }); console.log(r.status);`;
+      const kids = [0, 1].map(() => Bun.spawn(["bun", "-e", src], { env: { ...childEnv, LIFEOS_REVIEWER_TEST_SLEEP_MS: "1500" }, stdout: "pipe", stderr: "pipe" }));
+      const outs = await Promise.all(kids.map(async (k) => { await k.exited; return (await new Response(k.stdout).text()).trim(); }));
+      const fresh = rows().slice(before);
+      expect(fresh.filter((x) => x.status === "started").length).toBe(1);
+      expect(outs.sort()).toEqual(["completed", "skipped-overlap"]);
+      expect(existsSync(LOCK)).toBe(false);
+      expect(require("node:fs").readdirSync(join(root, "reviewer-runs")).filter((f: string) => f.endsWith(".stale"))).toEqual([]);
+    }
+  }, 60_000);
+
+  test("a contender whose rename finds the lock already gone refuses", () => {
+    clearLock();
+    expect(takeOverStaleLock(LOCK, JSON.stringify({ pid: 1, runId: "gone", started: "x" }))).toBe(false);
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  test("a contender that moved a fresh lock (not the one judged stale) refuses and puts it back", () => {
+    clearLock();
+    const judged = JSON.stringify({ pid: 999999, runId: "judged-stale", started: new Date().toISOString() });
+    const fresh = JSON.stringify({ pid: process.pid, runId: "winner", started: new Date().toISOString() });
+    writeFileSync(LOCK, fresh); // the other contender already took over and created its lock
+    expect(takeOverStaleLock(LOCK, judged)).toBe(false);
+    expect(readFileSync(LOCK, "utf8")).toBe(fresh);
+    expect(require("node:fs").readdirSync(join(root, "reviewer-runs")).filter((f: string) => f.endsWith(".stale"))).toEqual([]);
+    clearLock();
+  });
+
+  test("a live holder is never taken before 30 min", async () => {
+    clearLock();
+    const sleeper = Bun.spawn(["sleep", "30"]);
+    for (const ageMin of [0, 15, 29]) {
+      writeFileSync(LOCK, JSON.stringify({ pid: sleeper.pid, runId: "live-run", started: new Date(Date.now() - ageMin * 60_000).toISOString() }));
+      const r = acquireRunLock("me", LOCK);
+      expect(r.ok).toBe(false);
+      expect(JSON.parse(readFileSync(LOCK, "utf8")).runId).toBe("live-run");
+    }
+    sleeper.kill("SIGKILL"); await sleeper.exited; // our own launch handle
+    clearLock();
+  }, 20_000);
 });

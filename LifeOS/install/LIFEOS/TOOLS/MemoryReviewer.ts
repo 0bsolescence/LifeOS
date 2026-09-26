@@ -33,7 +33,9 @@
 import {
   appendFileSync,
   closeSync,
+  linkSync,
   openSync,
+  renameSync,
   unlinkSync,
   writeSync,
   existsSync,
@@ -646,9 +648,9 @@ export type LockResult = { ok: true; takeover?: string } | { ok: false; holder: 
 interface RunState { runId: string; transcript: string | null; exchanges: number; startedMs: number; written: boolean; lockPath: string; note?: string }
 const runs = new Map<string, RunState>();
 
-function readHolder(lockPath: string): LockHolder | null {
+function readHolder(lockPath: string, raw?: string): LockHolder | null {
   try {
-    const h = JSON.parse(readFileSync(lockPath, "utf8"));
+    const h = JSON.parse(raw ?? readFileSync(lockPath, "utf8"));
     return h && typeof h.pid === "number" && typeof h.runId === "string" && typeof h.started === "string" ? h : null;
   } catch { return null; }
 }
@@ -674,17 +676,16 @@ function staleReason(holder: LockHolder | null, lockPath: string, nowMs: number)
 }
 
 /** Exclusive run lock: created with O_EXCL (`wx`), never truncate-then-write. On EEXIST the holder
- *  is read; a dead or hung holder is unlinked and creation retried once; a live one refuses.
+ *  is read; a live holder under 30 minutes refuses; a dead, hung or long-unreadable holder is taken
+ *  over by `takeOverStaleLock` (rename-and-verify), and only the contender whose rename moved the
+ *  very lock it judged stale goes on to create a fresh lock with `wx`.
  *
- *  ACCEPTED RESIDUAL (ruled 2026-09-25): stale takeover and release are check-then-unlink, not
- *  atomic. If A reads a stale lock, B takes it over, and A then unlinks B's fresh lock, both run;
- *  likewise a releasing run that pauses between its ownership read and the unlink can remove a
- *  lock another run just took over. The re-read before unlink narrows the window without closing
- *  it. Accepted because the fire hook spaces reviewer runs 30 minutes apart globally, so two
- *  reviewers contend only when two sessions' Stop hooks fire in the same second against a lock
- *  that is already stale. The fix, if it is ever needed: take over by renaming the lock to a
- *  unique name and verifying the renamed file's inode/content is the one judged stale (restoring
- *  it otherwise), or use a lock directory with an owner file. */
+ *  Why rename: an interrupted run leaves a dead-pid lock, and two Stop hooks (or a manual
+ *  `review`) can then contend for it in the same moment. With check-then-unlink, A could unlink
+ *  the fresh lock B had just created and both would dispatch the same items. rename(2) is atomic:
+ *  of the contenders renaming the same path, exactly one moves a given file.
+ *  Release is pid+runId-checked; its read-then-unlink window only matters after a sanctioned
+ *  30-minute hung-holder takeover of a still-live run. */
 export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): LockResult {
   const body = JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() });
   const create = (): boolean => {
@@ -693,22 +694,40 @@ export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, 
     try { writeSync(fd, body); } finally { closeSync(fd); }
     return true;
   };
+  const unknownHolder = { pid: -1, runId: "unknown (lock being written or just taken over)", started: "unknown" };
   try {
     mkdirSync(dirname(lockPath), { recursive: true });
     if (create()) return { ok: true };
-    const holder = readHolder(lockPath);
+    let raw: string;
+    try { raw = readFileSync(lockPath, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return { ok: false, holder: unknownHolder }; throw e; }
+    const holder = readHolder(lockPath, raw);
     const reason = staleReason(holder, lockPath, nowMs);
-    if (reason === null) return { ok: false, holder: holder ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
-    // Re-read immediately before unlinking so a lock another process just took over is not removed.
-    const again = readHolder(lockPath);
-    if (JSON.stringify(again) !== JSON.stringify(holder)) return { ok: false, holder: again ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
-    try { unlinkSync(lockPath); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+    if (reason === null) return { ok: false, holder: holder ?? unknownHolder };
+    if (!takeOverStaleLock(lockPath, raw)) return { ok: false, holder: readHolder(lockPath) ?? unknownHolder };
     if (create()) return { ok: true, takeover: `took over run lock from ${holder?.runId ?? "an unreadable lock"}: ${reason}` };
-    const winner = readHolder(lockPath);
-    return { ok: false, holder: winner ?? { pid: -1, runId: "unknown (lock being written)", started: "unknown" } };
+    return { ok: false, holder: readHolder(lockPath) ?? unknownHolder };
   } catch {
     return { ok: true, takeover: "run lock unavailable (filesystem error); ran unlocked" }; // never block a run on a lock I/O failure
   }
+}
+
+/** Move a lock judged stale out of the way, atomically. Renames it to a name unique to this process,
+ *  then verifies the moved file is byte-for-byte the one judged stale. Returns false (refuse) when
+ *  the rename finds nothing (another contender already took it) or moved a different lock (another
+ *  contender already created a fresh one), in which case that lock is linked back into place. */
+export function takeOverStaleLock(lockPath: string, judgedRaw: string): boolean {
+  const aside = `${lockPath}.${process.pid}.stale`;
+  try { renameSync(lockPath, aside); } catch (e: any) { if (e?.code === "ENOENT") return false; throw e; }
+  let moved: string | null = null;
+  try { moved = readFileSync(aside, "utf8"); } catch { moved = null; }
+  if (moved !== judgedRaw) {
+    // Not the lock we judged: put it back (link fails if yet another lock appeared; then leave it).
+    try { linkSync(aside, lockPath); } catch { /* a newer lock holds the path */ }
+    try { unlinkSync(aside); } catch { /* best-effort */ }
+    return false;
+  }
+  try { unlinkSync(aside); } catch { /* best-effort */ }
+  return true;
 }
 
 /** Release only a lock this process and this run hold. */
