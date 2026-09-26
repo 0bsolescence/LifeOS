@@ -101,11 +101,25 @@ export function assessCortexEvidence(input: CortexEvidence): CortexAssessment {
   return { overall, findings, thresholds };
 }
 
-function readJsonl(path: string): { rows: any[]; malformedLines: number[]; exists: boolean } {
-  if (!existsSync(path)) return { rows: [], malformedLines: [], exists: false };
-  const rows: any[] = [], malformedLines: number[] = [];
-  readFileSync(path, "utf8").split(/\r?\n/).forEach((line, index) => { if (!line.trim()) return; try { rows.push(JSON.parse(line)); } catch { malformedLines.push(index + 1); } });
-  return { rows, malformedLines, exists: true };
+function readJsonl(path: string): { rows: any[]; lines: number[]; malformedLines: number[]; exists: boolean } {
+  if (!existsSync(path)) return { rows: [], lines: [], malformedLines: [], exists: false };
+  const rows: any[] = [], lines: number[] = [], malformedLines: number[] = [];
+  readFileSync(path, "utf8").split(/\r?\n/).forEach((line, index) => { if (!line.trim()) return; try { rows.push(JSON.parse(line)); lines.push(index + 1); } catch { malformedLines.push(index + 1); } });
+  return { rows, lines, malformedLines, exists: true };
+}
+
+// Status vocabulary a reviewer row may carry (MemoryReviewer RunStatus), and which
+// statuses are consistent with the row's ok/skipped shape. Absent status = legacy row.
+const RUN_STATUSES = ["started", "completed", "skipped", "failed", "timed-out", "interrupted", "skipped-overlap"] as const;
+function reviewerRowMetaError(row: any): string | null {
+  if (row.status !== undefined && !(RUN_STATUSES as readonly string[]).includes(row.status)) return `unknown status ${JSON.stringify(row.status)}`;
+  if (row.reconstructed !== undefined && typeof row.reconstructed !== "boolean") return "reconstructed is not a boolean";
+  if (row.note !== undefined && typeof row.note !== "string") return "note is not a string";
+  if (row.status === undefined || row.status === "started") return null;
+  if (row.skipped === true) return ["skipped", "skipped-overlap"].includes(row.status) ? null : `skipped row with status ${row.status}`;
+  if (row.ok === true) return row.status === "completed" ? null : `ok:true row with status ${row.status}`;
+  if (row.ok === false) return ["failed", "timed-out", "interrupted"].includes(row.status) ? null : `ok:false row with status ${row.status}`;
+  return null;
 }
 
 function runMs(runId?: string): number {
@@ -119,33 +133,54 @@ function reviewerEvidence(obs: string, nowMs: number, thresholds: CortexThreshol
   if (parsed.malformedLines.length) return { status: "parse-failed", evidence: log, error: `malformed JSONL lines: ${parsed.malformedLines.join(",")}` };
   // 2026-09-25: rows are ordered by their own timestamp, not file position, because a
   // reconciliation may append a `reconstructed` row for an old run; `started` rows are
-  // non-terminal markers and never count as the latest terminal evidence.
-  const rowMs = (r: any) => (r?.ts ? Date.parse(r.ts) : runMs(r?.runId));
-  const ordered = parsed.rows.filter((r) => Number.isFinite(rowMs(r))).sort((a, b) => rowMs(a) - rowMs(b));
+  // non-terminal markers and never count as the latest terminal evidence. A row whose
+  // timestamp cannot be read is invalid evidence, never silently dropped.
+  const rowMs = (r: any) => (r?.ts !== undefined ? (typeof r.ts === "string" ? Date.parse(r.ts) : Number.NaN) : runMs(r?.runId));
+  for (let i = 0; i < parsed.rows.length; i++) {
+    const r = parsed.rows[i];
+    if (!Number.isFinite(rowMs(r))) return { status: "invalid", evidence: `${log}:${parsed.lines[i]}`, error: `line ${parsed.lines[i]} has no parseable timestamp: ${JSON.stringify(r).slice(0, 200)}` };
+  }
+  const ordered = parsed.rows.map((r, i) => ({ r, i })).sort((a, b) => rowMs(a.r) - rowMs(b.r) || a.i - b.i).map((x) => x.r);
   const terminal = ordered.filter((r) => r.status !== "started");
+  const terminalIds = new Set(terminal.map((r) => r.runId));
   const latest = terminal.at(-1);
-  const latestRowMs = rowMs(latest);
+  // A skip (empty transcript, or another run holding the lock) is not evidence that an
+  // earlier run finished: it never touched that run.
+  const latestRan = terminal.filter((r) => r.skipped !== true).at(-1);
+  const latestRanMs = latestRan ? rowMs(latestRan) : Number.NEGATIVE_INFINITY;
+  const prior = terminal.filter((r) => r.ok === true && r.skipped !== true).length;
+
+  // (1) A started row with no terminal row of its own: running inside the grace window,
+  // interrupted after it — unless a later run actually ran, which supersedes it.
+  const orphan = ordered.filter((r) => r.status === "started" && !terminalIds.has(r.runId)).at(-1);
+  if (orphan && rowMs(orphan) > latestRanMs) {
+    const startedMs = rowMs(orphan);
+    const ts = new Date(startedMs).toISOString();
+    if (nowMs - startedMs <= thresholds.reviewerRunGraceMs) return { status: "running", ts, runId: orphan.runId, evidence: `${log}:started`, priorSuccesses: prior };
+    return { status: "interrupted", ts, runId: orphan.runId, evidence: `${log}:started`, error: `started (pid ${orphan.pid ?? "?"}) and left no terminal row within ${thresholds.reviewerRunGraceMs}ms — the process was ended, not timed out`, priorSuccesses: prior };
+  }
+
+  // (2) A run directory with no terminal row of its own, newer than the last run that ran:
+  // still going, or ended before it could write a row (reviewers older than the started marker).
   const runsDir = join(obs, "reviewer-runs");
   const dirs = existsSync(runsDir) ? readdirSync(runsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort() : [];
   const latestDir = dirs.at(-1);
   const latestDirMs = runMs(latestDir);
-  if (latestDir && Number.isFinite(latestDirMs) && (!Number.isFinite(latestRowMs) || latestDirMs > latestRowMs)) {
-    // A run directory newer than every terminal row: the run is either still going,
-    // was ended before it could write its row (interrupted), or never reached the
-    // started marker (an older reviewer, or a spawn that died before inference).
+  if (latestDir && Number.isFinite(latestDirMs) && !terminalIds.has(latestDir) && latestDirMs > latestRanMs) {
     const path = join(runsDir, latestDir);
-    const prior = terminal.filter((r) => r.ok === true).length;
-    const started = ordered.find((r) => r.status === "started" && r.runId === latestDir);
-    if (existsSync(join(path, "parse-error.txt"))) return { status: "parse-failed", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: join(path, "parse-error.txt"), priorSuccesses: prior };
-    if (nowMs - latestDirMs <= thresholds.reviewerRunGraceMs) return { status: "running", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, priorSuccesses: prior };
-    if (started) return { status: "interrupted", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, error: `started (pid ${started.pid ?? "?"}) and left no terminal row within ${thresholds.reviewerRunGraceMs}ms — the process was ended, not timed out`, priorSuccesses: prior };
-    return { status: "never-started", ts: new Date(latestDirMs).toISOString(), runId: latestDir, evidence: path, error: `run directory exists with no started row and no terminal row within ${thresholds.reviewerRunGraceMs}ms (pre-2026-09-25 reviewer, or died before inference)`, priorSuccesses: prior };
+    const ts = new Date(latestDirMs).toISOString();
+    if (existsSync(join(path, "parse-error.txt"))) return { status: "parse-failed", ts, runId: latestDir, evidence: join(path, "parse-error.txt"), priorSuccesses: prior };
+    if (nowMs - latestDirMs <= thresholds.reviewerRunGraceMs) return { status: "running", ts, runId: latestDir, evidence: path, priorSuccesses: prior };
+    return { status: "never-started", ts, runId: latestDir, evidence: path, error: `run directory exists with no started row and no terminal row within ${thresholds.reviewerRunGraceMs}ms (pre-2026-09-25 reviewer, or died before inference)`, priorSuccesses: prior };
   }
+
   if (!latest) return { status: "missing", evidence: `${log} and ${runsDir}` };
+  const metaError = reviewerRowMetaError(latest);
+  if (metaError) return { status: "invalid", ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: metaError, priorSuccesses: prior };
   const error = String(latest.error ?? "");
   if (latest.skipped === true) {
     const status: ReviewerEvidence["status"] = validReviewerSkip(latest) ? "skipped" : "invalid";
-    return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: terminal.slice(0, -1).filter((r) => r.ok === true && r.skipped !== true).length };
+    return { status, ts: latest.ts, runId: latest.runId, evidence: `${log}:latest`, error: latest.error, priorSuccesses: prior };
   }
   const validSuccess = validReviewerSuccess(latest);
   const explicit = typeof latest.status === "string" ? latest.status : "";
