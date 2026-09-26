@@ -674,7 +674,17 @@ function staleReason(holder: LockHolder | null, lockPath: string, nowMs: number)
 }
 
 /** Exclusive run lock: created with O_EXCL (`wx`), never truncate-then-write. On EEXIST the holder
- *  is read; a dead or hung holder is unlinked and creation retried once; a live one refuses. */
+ *  is read; a dead or hung holder is unlinked and creation retried once; a live one refuses.
+ *
+ *  ACCEPTED RESIDUAL (ruled 2026-09-25): stale takeover and release are check-then-unlink, not
+ *  atomic. If A reads a stale lock, B takes it over, and A then unlinks B's fresh lock, both run;
+ *  likewise a releasing run that pauses between its ownership read and the unlink can remove a
+ *  lock another run just took over. The re-read before unlink narrows the window without closing
+ *  it. Accepted because the fire hook spaces reviewer runs 30 minutes apart globally, so two
+ *  reviewers contend only when two sessions' Stop hooks fire in the same second against a lock
+ *  that is already stale. The fix, if it is ever needed: take over by renaming the lock to a
+ *  unique name and verifying the renamed file's inode/content is the one judged stale (restoring
+ *  it otherwise), or use a lock directory with an owner file. */
 export function acquireRunLock(runId: string, lockPath: string = RUN_LOCK_PATH, nowMs: number = Date.now()): LockResult {
   const body = JSON.stringify({ pid: process.pid, runId, started: new Date(nowMs).toISOString() });
   const create = (): boolean => {

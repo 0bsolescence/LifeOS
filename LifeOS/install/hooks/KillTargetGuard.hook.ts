@@ -153,19 +153,24 @@ function walk(words: string[]): Walk {
   return { cmd: "", args: [], remote, viaXargs };
 }
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish", "su"]);
-let payloadMemo: { prefix: string; v: boolean } = { prefix: "", v: false };
-function isPayloadCtx(prefix: string): boolean {
+// "remote": ssh/eval join every argument into one program. "shell": `bash -c '<payload>' '<arg0>'`
+// runs only the first string after -c; later strings are $0, $1 (data). null: not a payload.
+type PayloadKind = "remote" | "shell" | null;
+let payloadMemo: { prefix: string; v: PayloadKind } = { prefix: "", v: null };
+function payloadKind(prefix: string): PayloadKind {
   // The prefix is capped at 256 chars, so a long segment asks the same question repeatedly.
   if (prefix === payloadMemo.prefix) return payloadMemo.v;
-  const v = isPayloadCtxUncached(prefix);
+  const v = payloadKindUncached(prefix);
   payloadMemo = { prefix, v };
   return v;
 }
-function isPayloadCtxUncached(prefix: string): boolean {
+function payloadKindUncached(prefix: string): PayloadKind {
   const words = prefix.trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return false;
+  if (words.length === 0) return null;
   const w = walk(words);
-  return SHELLS.has(w.cmd) || w.remote;
+  if (w.remote) return "remote";
+  if (SHELLS.has(w.cmd) && w.args.some((a) => a === "--command" || /^-[A-Za-z]*c[A-Za-z]*$/.test(a))) return "shell";
+  return null;
 }
 
 // ── Heredocs (top level). A `<<TAG` outside quotes, not a here-string (`<<<`) and
@@ -173,7 +178,13 @@ function isPayloadCtxUncached(prefix: string): boolean {
 // shell (`bash <<EOF`, `cat <<EOF | sh`) it is scanned as commands, and with an
 // unquoted tag its `$(…)`/backtick substitutions run at write time and are scanned.
 function lineIsShellFed(line: string): boolean {
-  return line.split(/[|;&(]/).some((piece) => isPayloadCtx(piece));
+  // A heredoc is the script of the shell reading it (`bash <<EOF`, `cat <<EOF | sh`): no -c needed.
+  return line.split(/[|;&(]/).some((piece) => {
+    const words = piece.trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return false;
+    const w = walk(words);
+    return SHELLS.has(w.cmd) || w.remote;
+  });
 }
 function substitutions(body: string): string[] {
   const out: string[] = [];
@@ -250,7 +261,6 @@ function neutralizeDouble(content: string): string {
     if (c === "\\") { r += "__"; k++; continue; }
     if (c === "$" && content[k + 1] === "(") { const j = endOfGroup(content, k + 2); r += content.slice(k, j + 1); k = j; continue; }
     if (c === "`") { const j = endOfBacktick(content, k + 1); r += content.slice(k, j + 1); k = j; continue; }
-    if (c === "$" && content[k + 1] === "{") { const j = content.indexOf("}", k); const e = j < 0 ? content.length - 1 : j; r += content.slice(k, e + 1).replace(/\s/g, "_"); k = e; continue; }
     r += /[\s;&|()<>'"#]/.test(c) ? "_" : c;
   }
   return r;
@@ -258,8 +268,15 @@ function neutralizeDouble(content: string): string {
 function execText(s: string, depth: number): string {
   if (depth > MAX_DEPTH) throw new TooDeep();
   const out: string[] = [];
-  let seg = "";
+  let seg = "", shellPayloadTaken = false;
   const push = (x: string) => { out.push(x); if (seg.length < 256) seg += x; };
+  // Is this quoted string a program? ssh/eval: every one; `sh -c`: only the first.
+  const takePayload = (): boolean => {
+    const k = payloadKind(seg);
+    if (k === "remote") return true;
+    if (k === "shell" && !shellPayloadTaken) { shellPayloadTaken = true; return true; }
+    return false;
+  };
   const n = s.length;
   for (let i = 0; i < n;) {
     const c = s[i];
@@ -269,20 +286,20 @@ function execText(s: string, depth: number): string {
       const st = c === "'" ? i + 1 : i + 2;
       const j = c === "'" ? endOfSingle(s, st) : endOfAnsi(s, st);
       const content = s.slice(st, j);
-      if (isPayloadCtx(seg)) out.push("\n", execText(content, depth + 1), "\n");
+      if (takePayload()) out.push("\n", execText(content, depth + 1), "\n");
       else push(neutral(content));
       i = j + 1; continue;
     }
     if (c === '"') {
       const j = endOfDouble(s, i + 1, depth);
       const content = s.slice(i + 1, j);
-      if (isPayloadCtx(seg)) out.push("\n", execText(content, depth + 1), "\n");
+      if (takePayload()) out.push("\n", execText(content, depth + 1), "\n");
       else push(/[$`]/.test(content) ? neutralizeDouble(content) : neutral(content));
       i = j + 1; continue;
     }
     if (c === "$" && s[i + 1] === "(") { const j = endOfGroup(s, i + 2, depth); push(s.slice(i, j + 1)); i = j + 1; continue; }
     if (c === "`") { const j = endOfBacktick(s, i + 1); push(s.slice(i, j + 1)); i = j + 1; continue; }
-    if (";&|\n()".includes(c)) { out.push(c); seg = ""; i++; continue; }
+    if (";&|\n()".includes(c)) { out.push(c); seg = ""; shellPayloadTaken = false; i++; continue; }
     push(c); i++;
   }
   return out.join("");
@@ -333,7 +350,9 @@ function judgeKill(k: { args: string[]; viaXargs: boolean; text: string }, searc
   if (a[i] === "--") i++;
   if (sig !== null && /^(SIG)?0$/i.test(sig)) return null; // signal 0 is a liveness probe; nothing is delivered
   if (k.viaXargs && search) return { refuse: true, reason: "a process search piped into kill", match: k.text };
-  for (const t of a.slice(i)) {
+  for (const raw of a.slice(i)) {
+    // Leading zeros change nothing to kill: `00` is `0`, `0$T` is `$T`, `-007` is `-7`.
+    const t = raw.replace(/^(-?)0+(?=[0-9$])/, "$1");
     if (/\$\(|`/.test(t)) return { refuse: true, reason: "kill target derived from a search or substitution", match: k.text };
     if (t.startsWith("-") || t === "0") return { refuse: true, reason: "process-group / -1 target (cannot be verified as this session's)", match: k.text };
     if (search && /^\$\{?[A-Za-z_0-9@*]/.test(t)) return { refuse: true, reason: "kill target is a variable in a command that runs a process search", match: k.text };

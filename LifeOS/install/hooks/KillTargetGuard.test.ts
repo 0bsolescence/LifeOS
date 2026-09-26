@@ -137,3 +137,19 @@ describe('codex re-review: new P1 regressions', () => {
   test('fd redirections still parse', () => allow('make build 2>&1 >/dev/null; echo done 2>/dev/null'));
   test('sudo --user root on a safe command', () => allow('sudo --user root systemctl status x'));
 });
+
+describe('last round: target normalisation, ${…} defaults, sh -c positional args', () => {
+  test('kill -9 00 is process group 0', () => refuse('kill -9 00'));
+  test('kill -9 0$TGT after a search', () => refuse('TGT=$(pgrep -n sleep); kill -9 0$TGT'));
+  test('kill -9 -007 is a group', () => refuse('kill -9 -007'));
+  test('kill 0123 literal pid stays allowed', () => allow('kill 0123'));
+  test('substitution inside a ${…} default in double quotes', () => refuse('unset x; echo "${x:-$(pkill -f sleep)}"'));
+  test('substitution inside an unquoted ${…} default', () => refuse('echo ${x:-$(pkill -f sleep)}'));
+  test('${…} with spaces stays one data word', () => allow('echo "${x:-a b; pkill c}"'));
+  test('sh -c positional strings are data', () => allow(`bash -c 'echo safe' 'pkill sleep'`));
+  test('sh -c payload is still scanned', () => refuse(`bash -c 'pkill sleep' arg0`));
+  test('bash -lc payload is scanned', () => refuse(`bash -lc 'pkill sleep'`));
+  test('a quoted script argument without -c is data', () => allow(`bash ./run.sh 'pkill is a word here'`));
+  test('heredoc to a shell still scanned without -c', () => refuse('sh <<EOF\npkill x\nEOF'));
+  test('ssh joins every quoted arg', () => refuse(`ssh host 'echo a' 'pkill b'`));
+});

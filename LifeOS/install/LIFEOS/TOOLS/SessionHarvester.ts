@@ -317,6 +317,9 @@ export function harvestLearnings(sessionPath: string): HarvestedLearning[] {
   const lines = content.split('\n').filter(line => line.trim());
 
   let previousContext = '';
+  // The role of the previous substantive turn: a correction answers the assistant, so a user
+  // turn that follows another user turn (a follow-up, a paste, a dispatch) is never one.
+  let previousRole = '';
 
   for (const line of lines) {
     try {
@@ -334,7 +337,7 @@ export function harvestLearnings(sessionPath: string): HarvestedLearning[] {
       // a capture with no preceding assistant turn (empty context) is a prompt by construction.
       if (entry.type === 'user') {
         const { matches, matchedPattern } = isCorrectionTurn(textContent);
-        if (matches && previousContext.length > 0) {
+        if (matches && previousRole === 'assistant' && previousContext.length > 0) {
           learnings.push({
             sessionId,
             timestamp,
@@ -346,6 +349,7 @@ export function harvestLearnings(sessionPath: string): HarvestedLearning[] {
           });
         }
         previousContext = textContent;
+        previousRole = 'user';
       }
 
       // Check for errors (assistant messages with error patterns)
@@ -381,6 +385,7 @@ export function harvestLearnings(sessionPath: string): HarvestedLearning[] {
         }
 
         previousContext = textContent;
+        previousRole = 'assistant';
       }
     } catch {
       // Skip malformed lines

@@ -69,3 +69,14 @@ describe("agent-transcript head sniff", () => {
     expect(performance.now() - t0).toBeLessThan(20);
   });
 });
+
+describe("a correction answers the assistant", () => {
+  test("a user turn following a user turn is not a correction", () => {
+    const p = session([["user", "a question about naming the field please"], ["assistant", ASSIST], ["user", "one more thing about the other file too"], ["user", "Actually, use snake_case for the identifier."]]);
+    expect(corrections(p).length).toBe(0);
+  });
+  test("the same turn right after the assistant is", () => {
+    const p = session([["user", "a question about naming the field please"], ["assistant", ASSIST], ["user", "Actually, use snake_case for the identifier."]]);
+    expect(corrections(p).length).toBe(1);
+  });
+});
