@@ -849,7 +849,7 @@ export function add(item: TypedItem): AddResult {
     const trimmed = t.trim();
     if (trimmed.startsWith("~/")) return pathJoin(homedir(), trimmed.slice(2));
     if (trimmed.startsWith("/")) return trimmed;
-    return pathJoin(LIFEOS_DIR, trimmed);
+    return pathJoin(process.env.LIFEOS_DIR || pathJoin(CLAUDE_ROOT, "LIFEOS"), trimmed);
   };
   const boundaryTarget = entry.write_mode === "queue"
     ? (typeof (item as any).target_file === "string" && (item as any).target_file.trim().length > 0
