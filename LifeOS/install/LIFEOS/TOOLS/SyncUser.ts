@@ -31,7 +31,7 @@
 
 import { existsSync, lstatSync, readlinkSync } from "node:fs";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 const HOME = process.env.HOME || "";
 const CONFIG_DIR = process.env.LIFEOS_CONFIG_DIR || join(HOME, ".config", "LIFEOS");
@@ -135,11 +135,19 @@ function cmdStatus(): void {
  * pull or push on top of it: the next run would commit the conflict markers as
  * content (a field node, 2026-10-06 23:01, four files incl. DA_MEMORY.md; the same
  * class had already landed once on 2026-09-08, 0f5c794). Git reports an active
- * rebase through .git/rebase-merge or .git/rebase-apply, so that is the check.
+ * rebase through its rebase-merge or rebase-apply state dir, so that is the check.
+ *
+ * Ask git WHERE that state lives rather than assuming `<repo>/.git/<state>`: `.git`
+ * is a file in a linked worktree or a `--separate-git-dir` repo, and a path check
+ * there returns false during a live rebase (cross-vendor review finding, 2026-10-07;
+ * reproduced: the tool committed markers and then reported "nothing changed").
  */
 export function rebaseInProgress(configDir = CONFIG_DIR): boolean {
-  return existsSync(join(configDir, ".git", "rebase-merge")) ||
-    existsSync(join(configDir, ".git", "rebase-apply"));
+  for (const state of ["rebase-merge", "rebase-apply"]) {
+    const r = git(["rev-parse", "--git-path", state], configDir);
+    if (r.code === 0 && r.out && existsSync(resolve(configDir, r.out))) return true;
+  }
+  return false;
 }
 
 function refuseIfRebasing(): void {
@@ -201,9 +209,7 @@ function cmdSync(): void {
     // auth) is a different failure with a different fix — labelling it a
     // conflict sent a day of diagnosis the wrong way (2026-09-01: a sandboxed
     // unit's ssh error was recorded as "rebase conflict" in the handoff).
-    const rebasing = existsSync(join(CONFIG_DIR, ".git", "rebase-merge")) ||
-      existsSync(join(CONFIG_DIR, ".git", "rebase-apply"));
-    if (rebasing) {
+    if (rebaseInProgress()) {
       console.error("❌ REBASE CONFLICT — halting. Your files are untouched on disk.\n");
       console.error(pull.err || pull.out);
       console.error("\nResolve deliberately, then re-run:");

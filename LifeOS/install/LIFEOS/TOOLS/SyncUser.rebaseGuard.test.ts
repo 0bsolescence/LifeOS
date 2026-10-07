@@ -12,7 +12,7 @@
  * alone.
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -56,7 +56,7 @@ afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 describe("SyncUser refuses to touch a tree with an active rebase", () => {
   test("sync: exits non-zero, names the rebase, and HEAD does not move", () => {
     const before = git(["rev-parse", "HEAD"], repo).out.trim();
-    const r = sh(["bun", TOOL, "sync"], repo, { LIFEOS_CONFIG_DIR: repo });
+    const r = sh([process.execPath, TOOL, "sync"], repo, { LIFEOS_CONFIG_DIR: repo });
     const after = git(["rev-parse", "HEAD"], repo).out.trim();
     expect(r.code).not.toBe(0);
     expect(r.err).toContain("REBASE IN PROGRESS");
@@ -67,7 +67,7 @@ describe("SyncUser refuses to touch a tree with an active rebase", () => {
 
   test("pull: refuses the same way", () => {
     const before = git(["rev-parse", "HEAD"], repo).out.trim();
-    const r = sh(["bun", TOOL, "pull"], repo, { LIFEOS_CONFIG_DIR: repo });
+    const r = sh([process.execPath, TOOL, "pull"], repo, { LIFEOS_CONFIG_DIR: repo });
     expect(r.code).not.toBe(0);
     expect(r.err).toContain("REBASE IN PROGRESS");
     expect(git(["rev-parse", "HEAD"], repo).out.trim()).toBe(before);
@@ -76,7 +76,51 @@ describe("SyncUser refuses to touch a tree with an active rebase", () => {
   test("control: after `git rebase --abort` the guard no longer fires", () => {
     git(["rebase", "--abort"], repo);
     expect(existsSync(join(repo, ".git", "rebase-merge"))).toBe(false);
-    const r = sh(["bun", TOOL, "status"], repo, { LIFEOS_CONFIG_DIR: repo });
+    const r = sh([process.execPath, TOOL, "status"], repo, { LIFEOS_CONFIG_DIR: repo });
     expect(r.err).not.toContain("REBASE IN PROGRESS");
+  });
+});
+
+/**
+ * `.git` is a FILE in a linked worktree or a `--separate-git-dir` repo, so a check that
+ * assumes `<repo>/.git/rebase-merge` misses a live rebase there. Cross-vendor review
+ * finding (2026-10-07); the negative control against the path-based check reproduced
+ * it: the tool committed a marker and then reported "nothing changed locally".
+ */
+describe("the check asks git where its state lives (.git may be a file)", () => {
+  let root2 = "";
+  let repo2 = "";
+
+  beforeAll(() => {
+    root2 = mkdtempSync(join(tmpdir(), "syncuser-guard-sepgit-"));
+    repo2 = join(root2, "repo");
+    git(["init", "-q", "--bare", "remote.git"], root2);
+    git(["clone", "-q", `--separate-git-dir=${join(root2, "gitdir")}`, join(root2, "remote.git"), "repo"], root2);
+    git(["commit", "-q", "--allow-empty", "-m", "base"], repo2);
+    writeFileSync(join(repo2, "f.txt"), "A\n");
+    git(["add", "f.txt"], repo2);
+    git(["commit", "-q", "-m", "add f"], repo2);
+    git(["branch", "-M", "master"], repo2);
+    git(["push", "-q", "-u", "origin", "master"], repo2);
+    git(["checkout", "-q", "-b", "side"], repo2);
+    writeFileSync(join(repo2, "f.txt"), "side\n");
+    git(["commit", "-qam", "side edit"], repo2);
+    git(["checkout", "-q", "master"], repo2);
+    writeFileSync(join(repo2, "f.txt"), "master\n");
+    git(["commit", "-qam", "master edit"], repo2);
+    git(["checkout", "-q", "side"], repo2);
+    sh(["git", "rebase", "master"], repo2, { GIT_EDITOR: "true" });
+    if (!statSync(join(repo2, ".git")).isFile()) throw new Error("fixture: .git should be a file here");
+    if (!existsSync(join(root2, "gitdir", "rebase-merge"))) throw new Error("fixture did not enter a rebase");
+  });
+  afterAll(() => { if (root2) rmSync(root2, { recursive: true, force: true }); });
+
+  test("sync refuses and HEAD does not move when .git is a file", () => {
+    const before = git(["rev-parse", "HEAD"], repo2).out.trim();
+    const r = sh([process.execPath, TOOL, "sync"], repo2, { LIFEOS_CONFIG_DIR: repo2 });
+    expect(r.code).not.toBe(0);
+    expect(r.err).toContain("REBASE IN PROGRESS");
+    expect(git(["rev-parse", "HEAD"], repo2).out.trim()).toBe(before);
+    expect(r.out).not.toContain("committed:");
   });
 });
