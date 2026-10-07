@@ -1,9 +1,9 @@
 /**
  * SyncUser.ts must refuse to create ordinary commits while git reports an active
- * rebase. Origin: bekus-l3420, 2026-10-06 22:00 → 23:01 — a halted rebase, then the
+ * rebase. Origin: a field node, 2026-10-06 22:00 → 23:01 — a halted rebase, then the
  * next hourly `sync` committed the conflicted tree WITH markers (74f3fc95), and the
  * hook layer loaded a DA_MEMORY.md carrying `<<<<<<<` for six hours. The negative
- * control against the unpatched tool (2026-10-07 08:5x, tuf) reproduced it: HEAD
+ * control against the unpatched tool (2026-10-07 08:5x) reproduced it: HEAD
  * advanced and the commit carried a marker line.
  *
  * The test builds a scratch repo with a real conflicting rebase (so

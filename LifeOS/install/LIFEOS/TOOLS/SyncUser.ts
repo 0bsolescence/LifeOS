@@ -133,7 +133,7 @@ function cmdStatus(): void {
 /**
  * A rebase left behind by an earlier run. Unattended code must never add, commit,
  * pull or push on top of it: the next run would commit the conflict markers as
- * content (bekus-l3420, 2026-10-06 23:01, four files incl. DA_MEMORY.md; the same
+ * content (a field node, 2026-10-06 23:01, four files incl. DA_MEMORY.md; the same
  * class had already landed once on 2026-09-08, 0f5c794). Git reports an active
  * rebase through .git/rebase-merge or .git/rebase-apply, so that is the check.
  */
