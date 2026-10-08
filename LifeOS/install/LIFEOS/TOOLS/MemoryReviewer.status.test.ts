@@ -83,7 +83,7 @@ const childEnv = { ...process.env, LIFEOS_REVIEWER_OBS_DIR: root };
 function holderChild(runId: string, holdMs: number) {
   // A separate process that takes the lock through the real API and holds it.
   const src = `const m = await import(${JSON.stringify(MOD)}); const r = m.acquireRunLock(${JSON.stringify(runId)}, ${JSON.stringify(LOCK)}); console.log(JSON.stringify(r)); await new Promise((res) => setTimeout(res, ${holdMs}));`;
-  return Bun.spawn(["bun", "-e", src], { env: childEnv, stdout: "pipe", stderr: "pipe" });
+  return Bun.spawn([process.execPath, "-e", src], { env: childEnv, stdout: "pipe", stderr: "pipe" });
 }
 async function firstLine(p: ReturnType<typeof holderChild>): Promise<any> {
   const reader = p.stdout.getReader(); let buf = "";
@@ -180,7 +180,7 @@ describe("a real SIGTERM mid-run", () => {
     clearLock();
     const t = transcript();
     const src = `const m = await import(${JSON.stringify(MOD)}); await m.review({ input: ${JSON.stringify(t)}, mockInferenceResponse: '{"items":[]}', dryRun: true, turns: 2 });`;
-    const child = Bun.spawn(["bun", "-e", src], { env: { ...childEnv, LIFEOS_REVIEWER_TEST_SLEEP_MS: "15000" }, stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn([process.execPath, "-e", src], { env: { ...childEnv, LIFEOS_REVIEWER_TEST_SLEEP_MS: "15000" }, stdout: "pipe", stderr: "pipe" });
     let started: any = null;
     for (let i = 0; i < 100 && !started; i++) { await Bun.sleep(100); started = rows().find((x) => x.status === "started" && x.pid === child.pid); }
     expect(started).toBeTruthy();
@@ -206,7 +206,7 @@ describe("stale takeover: serialised, never moves a lock that is not the stale o
       const t = transcript();
       const before = rows().length;
       const src = `const m = await import(${JSON.stringify(MOD)}); const r = await m.review({ input: ${JSON.stringify(t)}, mockInferenceResponse: '{"items":[]}', dryRun: true, turns: 2 }); console.log(r.status);`;
-      const kids = [0, 1].map(() => Bun.spawn(["bun", "-e", src], { env: { ...childEnv, LIFEOS_REVIEWER_TEST_SLEEP_MS: "1500" }, stdout: "pipe", stderr: "pipe" }));
+      const kids = [0, 1].map(() => Bun.spawn([process.execPath, "-e", src], { env: { ...childEnv, LIFEOS_REVIEWER_TEST_SLEEP_MS: "1500" }, stdout: "pipe", stderr: "pipe" }));
       const outs = await Promise.all(kids.map(async (k) => { await k.exited; return (await new Response(k.stdout).text()).trim(); }));
       const fresh = rows().slice(before);
       expect(fresh.filter((x) => x.status === "started").length).toBe(1);
