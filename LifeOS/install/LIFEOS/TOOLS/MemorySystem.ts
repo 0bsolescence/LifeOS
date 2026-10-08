@@ -86,6 +86,29 @@ import { assertInsideUserData } from "./lib/ForeignDataCheck";
 
 const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
 
+/**
+ * Resolve a proposal's `target_file` to the absolute path the system/user boundary
+ * is asserted against. Reviewer output writes targets in three shapes: absolute,
+ * `~/…`, and relative. A relative target that begins with `LIFEOS/` is relative to
+ * the harness root (the same convention every CLAUDE.md pointer uses:
+ * `LIFEOS/USER/CONFIG/OPERATIONAL_RULES.md`); joining it to LIFEOS_DIR produced
+ * `…/LIFEOS/LIFEOS/USER/…`, which the boundary correctly refused, and two real
+ * proposals were lost that way (reviewer run 2026-10-08T00-18-29-167Z). Any other
+ * relative target is relative to LIFEOS_DIR, as before.
+ */
+export function resolveProposalTargetForBoundary(
+  t: string,
+  roots: { claudeRoot?: string; lifeosDir?: string } = {},
+): string {
+  const claudeRoot = roots.claudeRoot ?? CLAUDE_ROOT;
+  const lifeosDir = roots.lifeosDir ?? (process.env.LIFEOS_DIR || pathJoin(claudeRoot, "LIFEOS"));
+  const trimmed = t.trim();
+  if (trimmed.startsWith("~/")) return pathJoin(homedir(), trimmed.slice(2));
+  if (trimmed.startsWith("/")) return trimmed;
+  if (trimmed === "LIFEOS" || trimmed.startsWith("LIFEOS/")) return pathJoin(claudeRoot, trimmed);
+  return pathJoin(lifeosDir, trimmed);
+}
+
 // ── Result types ──
 
 export interface AddOk {
@@ -845,12 +868,7 @@ export function add(item: TypedItem): AddResult {
   // inside the repo for a proposal is its eventual TARGET, so that is what the
   // boundary is asserted against (2026-09-20: every proposal enqueue had been
   // refused on the queue file's own path, INC-20260919 producer half).
-  const resolveTargetFileForBoundary = (t: string): string => {
-    const trimmed = t.trim();
-    if (trimmed.startsWith("~/")) return pathJoin(homedir(), trimmed.slice(2));
-    if (trimmed.startsWith("/")) return trimmed;
-    return pathJoin(process.env.LIFEOS_DIR || pathJoin(CLAUDE_ROOT, "LIFEOS"), trimmed);
-  };
+  const resolveTargetFileForBoundary = (t: string): string => resolveProposalTargetForBoundary(t);
   const boundaryTarget = entry.write_mode === "queue"
     ? (typeof (item as any).target_file === "string" && (item as any).target_file.trim().length > 0
         ? resolveTargetFileForBoundary((item as any).target_file)
